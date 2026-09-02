@@ -1,0 +1,13 @@
+{
+  "name": "nevo-messaging-rs-interop",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Wire-compatibility harness: drives the original TypeScript @riaskov/nevo-messaging against this crate",
+  "dependencies": {
+    "@msgpack/msgpack": "3.1.3",
+    "@nats-io/nats-core": "3.0.0",
+    "@nats-io/transport-node": "3.0.0",
+    "@riaskov/nevo-messaging": "2.5.0",
+    "reflect-metadata": "0.2.2"
+  }
+}

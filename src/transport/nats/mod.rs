@@ -189,17 +189,7 @@ impl Nats {
             .max_reconnects(config.max_reconnects)
             .connection_timeout(config.connection_timeout)
             .require_tls(config.require_tls)
-            .reconnect_delay_callback(move |attempts| {
-                if attempts == 0 {
-                    return Duration::ZERO;
-                }
-                let extra = if jitter.is_zero() {
-                    Duration::ZERO
-                } else {
-                    Duration::from_millis(rand::random_range(0..=jitter.as_millis() as u64))
-                };
-                delay + extra
-            })
+            .reconnect_delay_callback(move |attempts| reconnect_delay(delay, jitter, attempts))
             .event_callback(|event| async move {
                 match &event {
                     async_nats::Event::Connected => {
@@ -361,6 +351,19 @@ impl Transport for Nats {
     }
 }
 
+/// `async-nats` counts the initial connection as attempt 1; only reconnects wait.
+fn reconnect_delay(delay: Duration, jitter: Duration, attempts: usize) -> Duration {
+    if attempts <= 1 {
+        return Duration::ZERO;
+    }
+    let extra = if jitter.is_zero() {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(rand::random_range(0..=jitter.as_millis() as u64))
+    };
+    delay + extra
+}
+
 pub(crate) fn to_header_map(headers: &Headers) -> Option<HeaderMap> {
     if headers.is_empty() {
         return None;
@@ -449,4 +452,19 @@ fn other_error(err: impl std::error::Error + Send + Sync + 'static) -> Error {
     Error::new(ErrorCode::ConnectionLost, err.to_string())
         .with_retryable(true)
         .with_source(err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_connection_attempt_is_not_delayed() {
+        let delay = Duration::from_secs(5);
+        assert_eq!(reconnect_delay(delay, Duration::ZERO, 0), Duration::ZERO);
+        assert_eq!(reconnect_delay(delay, Duration::ZERO, 1), Duration::ZERO);
+        assert_eq!(reconnect_delay(delay, Duration::ZERO, 2), delay);
+        let jittered = reconnect_delay(delay, Duration::from_millis(100), 3);
+        assert!(jittered >= delay && jittered <= delay + Duration::from_millis(100));
+    }
 }

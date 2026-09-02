@@ -110,6 +110,7 @@ struct User {
     name: String,
     #[serde(rename = "createdAt")]
     created_at: String,
+    uid: uuid::Uuid,
     tags: Vec<String>,
     big: BigInt,
     #[serde(default)]
@@ -123,6 +124,7 @@ fn rust_router(service: &str, audits: Arc<AtomicU32>) -> Router {
         .route("user.getById", |_ctx: Context, p: GetById| async move {
             Ok(json!({
                 "id": p.id,
+                "uid": uuid::Uuid::new_v4(),
                 "name": "Rust Eddie",
                 "createdAt": "2026-01-02T03:04:05.000Z",
                 "tags": ["@@nevo:tricky", "plain"],
@@ -199,6 +201,8 @@ async fn typescript_and_rust_peers_interoperate() {
     assert_eq!(query["bigType"], "bigint");
     assert_eq!(query["tricky"], "@@nevo:tricky");
     assert_eq!(query["name"], "Rust Eddie");
+    assert_eq!(query["uidType"], "string");
+    assert_eq!(query["uid"].as_str().map(str::len), Some(36));
     assert_eq!(peer.expect("query-v2").await["version"], 2);
 
     let error = peer.expect("error").await;
@@ -261,6 +265,7 @@ async fn typescript_and_rust_peers_interoperate() {
     assert_eq!(user.id_type.as_deref(), Some("bigint"));
     assert_eq!(user.name, "TS Eddie");
     assert_eq!(user.created_at, "2026-01-02T03:04:05.000Z");
+    assert_eq!(user.uid.to_string(), "018f0d7a-6b6c-7c3e-9f2e-2f5a1a2b3c4d");
     assert_eq!(user.tags[0], "@@nevo:tricky");
     assert_eq!(user.big.as_str(), "1180591620717411303425");
     assert_eq!(user.list, vec![None, Some(BigInt::from(1u8))]);

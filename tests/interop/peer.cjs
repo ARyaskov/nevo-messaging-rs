@@ -24,6 +24,7 @@ class UserService {
       id,
       idType: typeof id,
       name: "TS Eddie",
+      uid: "018f0d7a-6b6c-7c3e-9f2e-2f5a1a2b3c4d",
       createdAt: new Date("2026-01-02T03:04:05.000Z"),
       tags: ["@@nevo:tricky", "plain"],
       big: (1n << 70n) + 1n,
@@ -106,7 +107,9 @@ async function callRust(client) {
     big: user.big,
     bigType: typeof user.big,
     tricky: user.tags[0],
-    date: user.createdAt
+    date: user.createdAt,
+    uid: user.uid,
+    uidType: typeof user.uid
   })
 
   const v2 = await client.query(rustService, "user.getById", { id: 1n }, { version: "v2" })

@@ -1,6 +1,6 @@
 [package]
 name = "nevo-messaging"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Microservices messaging framework wire-compatible with @riaskov/nevo-messaging: request/reply, events, pub/sub, broadcast over NATS with MessagePack/JSON, retry, circuit breaker, idempotency, ACL, discovery"
@@ -36,7 +36,7 @@ sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
-uuid = { version = "1", features = ["v4", "v7"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]

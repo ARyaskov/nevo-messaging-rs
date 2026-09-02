@@ -58,6 +58,11 @@ Shared value model:
 | string starting with `@@nevo:` | `"@@nevo:str:<original>"`, restored on decode |
 | `Option::None` | `null` (TypeScript drops `undefined` object members and turns array holes into `null`) |
 | `serde_bytes` / `Vec<u8>` | MessagePack `bin`; a `Uint8Array` in TypeScript |
+| `uuid::Uuid`, `chrono` timestamps, `IpAddr`, anything that picks a string form when the serializer is human-readable | that string form, in MessagePack as well as JSON |
+
+Both codecs report `is_human_readable() == true`, values and map keys alike:
+MessagePack is used here as a compact JSON, and a JavaScript peer expects a
+`uuid` to be a string, never sixteen bytes.
 
 A well-formed `@@nevo:bigint:<digits>` string is never escaped, so a `BigInt`
 embedded in a `serde_json::Value` (for example via `json!`) still arrives as a

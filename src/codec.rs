@@ -67,7 +67,7 @@ impl Codec {
                 let mut buf = Vec::with_capacity(128);
                 let mut ser = rmp_serde::Serializer::new(&mut buf).with_struct_map();
                 value
-                    .serialize(Escaping(&mut ser))
+                    .serialize(Escaping::new(&mut ser))
                     .map_err(|e| Error::parse(format!("MessagePack encode error: {e}")))?;
                 Ok(buf)
             }
@@ -75,7 +75,7 @@ impl Codec {
                 let mut buf = Vec::with_capacity(128);
                 let mut ser = serde_json::Serializer::new(&mut buf);
                 value
-                    .serialize(Escaping(&mut ser))
+                    .serialize(Escaping::new(&mut ser))
                     .map_err(|e| Error::parse(format!("JSON encode error: {e}")))?;
                 Ok(buf)
             }
@@ -83,22 +83,17 @@ impl Codec {
     }
 
     pub fn decode<T: DeserializeOwned>(self, bytes: &[u8]) -> Result<T> {
-        let escaped = may_contain_sentinel(bytes);
         match self {
             #[cfg(feature = "msgpack")]
             Self::MsgPack => {
                 let mut de = rmp_serde::Deserializer::from_read_ref(bytes);
-                let value = if escaped {
-                    T::deserialize(Unescaping(&mut de))
-                } else {
-                    T::deserialize(&mut de)
-                };
-                value.map_err(|e| Error::parse(format!("MessagePack decode error: {e}")))
+                T::deserialize(Unescaping::new(&mut de))
+                    .map_err(|e| Error::parse(format!("MessagePack decode error: {e}")))
             }
             Self::Json => {
                 let mut de = serde_json::Deserializer::from_slice(bytes);
-                let value = if escaped {
-                    T::deserialize(Unescaping(&mut de))
+                let value = if may_contain_sentinel(bytes) {
+                    T::deserialize(Unescaping::new(&mut de))
                 } else {
                     T::deserialize(&mut de)
                 };
@@ -188,6 +183,22 @@ mod tests {
         assert_eq!(err.code(), crate::ErrorCode::ParseError);
         let err = Codec::Json.decode::<Payload>(b"{} trailing").unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ParseError);
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn uuids_are_strings_in_msgpack_too() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Ref {
+            id: uuid::Uuid,
+        }
+        let value = Ref {
+            id: uuid::Uuid::new_v4(),
+        };
+        let bytes = Codec::MsgPack.encode(&value).unwrap();
+        let generic: serde_json::Value = Codec::MsgPack.decode(&bytes).unwrap();
+        assert_eq!(generic["id"], value.id.to_string());
+        assert_eq!(Codec::MsgPack.decode::<Ref>(&bytes).unwrap(), value);
     }
 
     #[test]

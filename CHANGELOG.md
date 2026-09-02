@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1
+
+- The NATS reconnect delay no longer applies to the very first connection
+  attempt; `async-nats` numbers that attempt 1, and the delay callback treated
+  it as a reconnect.
+- The MessagePack codec now presents itself as human-readable on every path,
+  including map keys, so `uuid::Uuid`, `chrono` timestamps, IP addresses and
+  similar types are encoded as strings, the representation the JavaScript peer
+  expects, instead of `bin` byte arrays. The `uuid` dependency now enables its
+  `serde` feature.
+
 ## 0.1.0
 
 Initial release: a Rust 2024 implementation of the Nevo Messaging protocol,

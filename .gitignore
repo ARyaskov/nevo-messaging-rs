@@ -1,7 +1,5 @@
 /target
-Cargo.lock
 tests/interop/node_modules/
-tests/interop/package-lock.json
 *.log
 .idea/
 .vscode/

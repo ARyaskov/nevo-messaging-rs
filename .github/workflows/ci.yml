@@ -4,34 +4,48 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly run surfaces newly published RustSec/GitHub advisories even without pushes.
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Third-party actions are pinned to commit SHAs; the trailing comment names the tag.
 jobs:
   check:
     name: Format, lint, docs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features
-      - run: cargo clippy --all-targets --no-default-features
-      - run: cargo doc --no-deps --all-features
+      - run: cargo clippy --locked --all-targets --all-features
+      - run: cargo clippy --locked --all-targets --no-default-features
+      - run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
   test:
     name: Tests (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -43,18 +57,93 @@ jobs:
           - 4222:4222
         options: --entrypoint "" nats:2 nats-server -js
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.toolchain }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
+      # Lockfile-exact install without lifecycle scripts.
       - name: Install the TypeScript peer
-        run: npm install --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: tests/interop
-      - run: cargo test --all-features
+      - run: cargo test --locked --all-features
         env:
           NEVO_TEST_NATS_URL: nats://127.0.0.1:4222
-      - run: cargo test --no-default-features --lib
+      - run: cargo test --locked --no-default-features --lib
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The CLI is used directly (not gitleaks-action) so no licence key is needed,
+      # and the tarball is checksum-verified before it runs.
+      - name: Install gitleaks
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Scan git history
+        run: gitleaks git --redact --verbose --exit-code 1 --report-format sarif --report-path gitleaks.sarif .
+
+      - name: Upload report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+          retention-days: 7
+
+  dependency-audit:
+    name: Dependency audit (cargo audit, cargo deny, npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+
+      # Vulnerable, unmaintained and yanked crates in the committed lockfile all fail.
+      - name: cargo audit (Cargo.lock)
+        run: cargo audit --deny warnings
+
+      # Advisories plus licence, duplicate/wildcard and registry policy from deny.toml.
+      - name: cargo deny
+        run: cargo deny check advisories bans licenses sources
+
+      # Downstream users resolve fresh versions, so the scheduled run also audits
+      # the newest semver-compatible graph.
+      - name: cargo audit (fresh resolution)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          cargo update
+          cargo audit --deny warnings
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: npm audit (interop harness)
+        run: npm audit --audit-level=moderate
+        working-directory: tests/interop

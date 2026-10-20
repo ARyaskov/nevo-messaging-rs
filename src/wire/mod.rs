@@ -81,11 +81,22 @@ impl TraceContext {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Auth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Auth")
+            .field(
+                "token",
+                &self.token.as_ref().map(|_| crate::redact::REDACTED),
+            )
+            .finish()
+    }
 }
 
 impl Auth {
@@ -164,6 +175,16 @@ impl Meta {
 
     pub fn auth_token(&self) -> Option<&str> {
         self.auth.as_ref()?.token.as_deref()
+    }
+
+    /// A copy safe to echo back on a reply: no `auth` and no credential-bearing headers.
+    pub fn without_credentials(&self) -> Self {
+        let mut meta = self.clone();
+        meta.auth = None;
+        if let Some(headers) = &mut meta.headers {
+            headers.retain(|name, _| !crate::redact::is_sensitive_key(name, &[]));
+        }
+        meta
     }
 
     pub fn traceparent(&self) -> Option<&str> {
@@ -361,6 +382,19 @@ mod tests {
         assert_eq!(out["custom"]["k"], 1);
         assert_eq!(out["type"], "query");
         assert!(out.get("auth").is_none());
+    }
+
+    #[test]
+    fn credentials_stay_out_of_debug_and_replies() {
+        let mut meta = Meta::new();
+        meta.auth = Some(Auth::token("s3cr3t"));
+        assert!(!format!("{meta:?}").contains("s3cr3t"));
+        meta.set_header("authorization", "Bearer s3cr3t");
+        meta.set_header("x-request-id", "r1");
+        let reply = meta.without_credentials();
+        assert!(reply.auth.is_none());
+        assert_eq!(reply.header("authorization"), None);
+        assert_eq!(reply.header("x-request-id"), Some("r1"));
     }
 
     #[test]

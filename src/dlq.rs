@@ -7,8 +7,11 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
+use serde_json::Value;
+
+use crate::codec::Codec;
 use crate::error::{Error, Result};
-use crate::redact::redact_meta;
+use crate::redact::{redact_meta, redacted};
 use crate::time::unix_millis;
 use crate::wire::Meta;
 
@@ -148,11 +151,16 @@ impl DlqRouter {
     }
 
     fn sanitise(&self, mut entry: DlqEntry) -> DlqEntry {
-        if self.redact
-            && let Some(meta) = &mut entry.meta
-        {
+        if !self.redact {
+            return entry;
+        }
+        if let Some(meta) = &mut entry.meta {
             redact_meta(meta, &self.redact_keys);
         }
+        entry.raw_payload = entry
+            .raw_payload
+            .take()
+            .and_then(|raw| redact_raw(raw, &self.redact_keys));
         entry
     }
 
@@ -167,6 +175,26 @@ impl DlqRouter {
             }
         }
     }
+}
+
+/// The raw envelope repeats `meta.auth` and may carry secrets in `params`; a payload that
+/// cannot be parsed for redaction is dropped rather than forwarded verbatim.
+fn redact_raw(raw: Bytes, extra_keys: &[String]) -> Option<Bytes> {
+    let parsed: Value = match Codec::detect(&raw)? {
+        #[cfg(feature = "msgpack")]
+        Codec::MsgPack => rmp_serde::from_slice(&raw).ok()?,
+        Codec::Json => serde_json::from_slice(&raw).ok()?,
+    };
+    let redacted = redacted(parsed.clone(), extra_keys);
+    if redacted == parsed {
+        return Some(raw);
+    }
+    let bytes = match Codec::detect(&raw)? {
+        #[cfg(feature = "msgpack")]
+        Codec::MsgPack => rmp_serde::to_vec_named(&redacted).ok()?,
+        Codec::Json => serde_json::to_vec(&redacted).ok()?,
+    };
+    Some(Bytes::from(bytes))
 }
 
 /// A bounded in-memory dead-letter store, handy for tests and small services.
@@ -271,5 +299,48 @@ mod tests {
             Some(crate::redact::REDACTED)
         );
         assert!(!DlqRouter::new().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn raw_payload_is_redacted_or_dropped() {
+        let store = InMemoryDlqStore::shared(10);
+        let router = DlqRouter::new().sink(Arc::clone(&store));
+        let mut meta = Meta::new();
+        meta.auth = Some(Auth::token("s3cr3t"));
+        let request = crate::wire::Request::new(
+            "u1",
+            "user.login",
+            serde_json::json!({"password": "hunter2", "name": "a"}),
+        )
+        .with_meta(meta);
+        let codecs = [
+            Codec::Json,
+            #[cfg(feature = "msgpack")]
+            Codec::MsgPack,
+        ];
+        for codec in codecs {
+            let raw = codec.encode(&request).unwrap();
+            router
+                .route(DlqEntry::new("t", "handler-error").raw_payload(raw))
+                .await;
+            let stored = store.list(1)[0].raw_payload.clone().unwrap();
+            let value: Value = codec.decode(&stored).unwrap();
+            assert_eq!(value["params"]["name"], "a");
+            assert_eq!(value["params"]["password"], crate::redact::REDACTED);
+            assert_eq!(value["meta"]["auth"], crate::redact::REDACTED);
+        }
+
+        router
+            .route(DlqEntry::new("t", "decode").raw_payload(Bytes::from_static(b"\x00garbage")))
+            .await;
+        assert!(store.list(1)[0].raw_payload.is_none());
+
+        let plain = InMemoryDlqStore::shared(1);
+        DlqRouter::new()
+            .redact(false)
+            .sink(Arc::clone(&plain))
+            .route(DlqEntry::new("t", "decode").raw_payload(Bytes::from_static(b"\x00garbage")))
+            .await;
+        assert!(plain.list(1)[0].raw_payload.is_some());
     }
 }

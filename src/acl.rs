@@ -267,10 +267,22 @@ impl AccessControl {
         let Some(claims) = verifier.verify(token).await? else {
             return Ok(None);
         };
+        let now_ms = crate::time::unix_millis() as f64;
+        // Enforced here too, in case a custom verifier only checks the signature.
+        let expired = claims
+            .get("exp")
+            .and_then(Value::as_f64)
+            .is_some_and(|exp| exp * 1000.0 <= now_ms);
+        let not_yet_valid = claims
+            .get("nbf")
+            .and_then(Value::as_f64)
+            .is_some_and(|nbf| nbf * 1000.0 > now_ms);
+        if expired || not_yet_valid {
+            return Ok(None);
+        }
         let mut expires_at = now + JWT_CACHE_TTL;
         if let Some(exp) = claims.get("exp").and_then(Value::as_f64) {
             let exp_ms = exp * 1000.0;
-            let now_ms = crate::time::unix_millis() as f64;
             if exp_ms < now_ms + JWT_CACHE_TTL.as_millis() as f64 {
                 let remaining = (exp_ms - now_ms).max(0.0);
                 expires_at = now + Duration::from_millis(remaining as u64);
@@ -393,5 +405,33 @@ mod tests {
         meta.auth = Some(crate::wire::Auth::token("bad"));
         meta.service = None;
         assert_eq!(verified.extract_caller(Some(&meta)).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn expired_or_premature_claims_are_rejected_even_if_the_verifier_accepts_them() {
+        let now = crate::time::unix_millis() as f64 / 1000.0;
+        let acl = AccessControl::new().verifier(move |token: &str| {
+            let (exp, nbf) = match token {
+                "expired" => (now - 10.0, now - 100.0),
+                "premature" => (now + 100.0, now + 50.0),
+                _ => (now + 100.0, now - 10.0),
+            };
+            async move {
+                let mut claims = Claims::new();
+                claims.insert("sub".into(), Value::String("svc".into()));
+                claims.insert("exp".into(), exp.into());
+                claims.insert("nbf".into(), nbf.into());
+                Ok(Some(claims))
+            }
+        });
+        let mut meta = Meta::new();
+        for (token, expected) in [("expired", None), ("premature", None), ("ok", Some("svc"))] {
+            meta.auth = Some(crate::wire::Auth::token(token));
+            assert_eq!(
+                acl.extract_caller(Some(&meta)).await.unwrap().as_deref(),
+                expected,
+                "{token}"
+            );
+        }
     }
 }

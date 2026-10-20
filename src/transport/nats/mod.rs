@@ -27,7 +27,7 @@ pub use server::{NatsServer, NatsServerBuilder, ServeConfig};
 
 pub const DEFAULT_SERVER: &str = "nats://127.0.0.1:4222";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub enum NatsAuth {
     #[default]
@@ -42,8 +42,37 @@ pub enum NatsAuth {
     Credentials(String),
 }
 
+impl fmt::Debug for NatsAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::redact::REDACTED;
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Token(_) => f.debug_tuple("Token").field(&REDACTED).finish(),
+            Self::UserPassword { user, .. } => f
+                .debug_struct("UserPassword")
+                .field("user", user)
+                .field("password", &REDACTED)
+                .finish(),
+            Self::Nkey(_) => f.debug_tuple("Nkey").field(&REDACTED).finish(),
+            Self::CredentialsFile(path) => f.debug_tuple("CredentialsFile").field(path).finish(),
+            Self::Credentials(_) => f.debug_tuple("Credentials").field(&REDACTED).finish(),
+        }
+    }
+}
+
+/// Drops `user:password@` from a server URL so it can be logged.
+fn redact_server_url(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let host_start = rest.find('/').unwrap_or(rest.len());
+    match rest[..host_start].rfind('@') {
+        Some(at) if scheme.is_empty() => format!("{}@{}", crate::redact::REDACTED, &rest[at + 1..]),
+        Some(at) => format!("{scheme}://{}@{}", crate::redact::REDACTED, &rest[at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
 /// Connection settings for [`Nats::connect`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct NatsConfig {
     pub servers: Vec<String>,
@@ -60,6 +89,25 @@ pub struct NatsConfig {
     /// Flush after every `emit`/`publish` so the broker has the message before the call returns.
     pub flush_after_publish: bool,
     pub inbox_prefix: Option<String>,
+}
+
+impl fmt::Debug for NatsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let servers: Vec<String> = self.servers.iter().map(|s| redact_server_url(s)).collect();
+        f.debug_struct("NatsConfig")
+            .field("servers", &servers)
+            .field("name", &self.name)
+            .field("auth", &self.auth)
+            .field("max_reconnects", &self.max_reconnects)
+            .field("reconnect_delay", &self.reconnect_delay)
+            .field("reconnect_jitter", &self.reconnect_jitter)
+            .field("connection_timeout", &self.connection_timeout)
+            .field("retry_on_initial_connect", &self.retry_on_initial_connect)
+            .field("require_tls", &self.require_tls)
+            .field("flush_after_publish", &self.flush_after_publish)
+            .field("inbox_prefix", &self.inbox_prefix)
+            .finish()
+    }
 }
 
 impl Default for NatsConfig {
@@ -457,6 +505,29 @@ fn other_error(err: impl std::error::Error + Send + Sync + 'static) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_hides_credentials() {
+        let config = NatsConfig::new()
+            .servers(["nats://alice:pw1@host:4222", "tls://h2:4222", "bob:pw2@h3"])
+            .auth(NatsAuth::UserPassword {
+                user: "alice".into(),
+                password: "pw3".into(),
+            });
+        let rendered = format!("{config:?}");
+        for secret in ["pw1", "pw2", "pw3"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert!(rendered.contains("nats://[REDACTED]@host:4222"));
+        assert!(rendered.contains("tls://h2:4222"));
+        for auth in [
+            NatsAuth::Token("t0k".into()),
+            NatsAuth::Nkey("SUAt0k".into()),
+            NatsAuth::Credentials("t0k".into()),
+        ] {
+            assert!(!format!("{auth:?}").contains("t0k"));
+        }
+    }
 
     #[test]
     fn first_connection_attempt_is_not_delayed() {

@@ -139,7 +139,7 @@ where
             })?;
             let uuid = ctx.uuid.clone();
             let method = ctx.method.clone();
-            let meta = ctx.meta.clone();
+            let meta = ctx.meta.without_credentials();
             let result = handler.call(ctx, request.params).await?;
             codec.encode(&Response::success(uuid, method, result).with_meta(Some(meta)))
         })
@@ -488,8 +488,8 @@ impl Router {
         meta: Option<&Meta>,
         err: &Error,
     ) -> Bytes {
-        let response =
-            Response::failure(uuid, method, self.public_wire(err)).with_meta(meta.cloned());
+        let response = Response::failure(uuid, method, self.public_wire(err))
+            .with_meta(meta.map(Meta::without_credentials));
         codec.encode(&response).unwrap_or_else(|encode_err| {
             tracing::error!(event = "dispatch.encode_failed", error = %encode_err);
             Bytes::from_static(b"{\"params\":{\"result\":\"error\",\"error\":{\"code\":15,\"message\":\"Internal error\"}}}")
@@ -810,7 +810,9 @@ mod erased {
             method: &str,
             meta: &Meta,
         ) -> Result<Bytes> {
-            codec.encode(&Response::success(uuid, method, self).with_meta(Some(meta.clone())))
+            codec.encode(
+                &Response::success(uuid, method, self).with_meta(Some(meta.without_credentials())),
+            )
         }
     }
 }
@@ -876,6 +878,20 @@ mod tests {
         assert_eq!(out["params"]["result"]["name"], "Eddie");
         assert_eq!(out["meta"]["service"], "caller");
         assert_eq!(router.request_topic(), "user-events");
+    }
+
+    #[tokio::test]
+    async fn replies_do_not_echo_the_callers_credentials() {
+        let router = router();
+        let mut meta = Meta::new();
+        meta.service = Some("caller".into());
+        meta.auth = Some(crate::wire::Auth::token("s3cr3t"));
+        for method in ["user.getById@v1", "user.missing"] {
+            let req = Request::new("u1", method, json!({"id": 7})).with_meta(meta.clone());
+            let (_, out) = call(&router, Codec::Json, req).await;
+            assert_eq!(out["meta"]["service"], "caller");
+            assert!(out["meta"].get("auth").is_none(), "{method}: {out}");
+        }
     }
 
     #[tokio::test]

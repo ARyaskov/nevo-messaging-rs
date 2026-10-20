@@ -22,10 +22,13 @@ impl ReplayGuard {
     }
 
     pub fn with_capacity(window: Duration, max_entries: usize) -> Self {
+        // A ts up to `window` in the future stays acceptable until `now + 2 * window`,
+        // so its uuid must be remembered that long or it can be replayed.
+        let retention = window.saturating_mul(2);
         Self {
             window,
             max_entries,
-            seen: (!window.is_zero()).then(|| Mutex::new(TtlLru::new(max_entries, window))),
+            seen: (!window.is_zero()).then(|| Mutex::new(TtlLru::new(max_entries, retention))),
             capacity_warned: AtomicBool::new(false),
         }
     }
@@ -101,5 +104,17 @@ mod tests {
         assert!(guard.check("", Some(now)).is_err());
         assert!(guard.check("u3", None).is_err());
         assert!(ReplayGuard::disabled().check("", None).is_ok());
+    }
+
+    #[test]
+    fn future_timestamp_cannot_be_replayed_after_one_window() {
+        let guard = ReplayGuard::new(Duration::from_millis(300));
+        let ts = unix_millis() + 280;
+        guard.check("future", Some(ts)).unwrap();
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(
+            guard.check("future", Some(ts)).unwrap_err().code(),
+            ErrorCode::ReplayDetected
+        );
     }
 }

@@ -50,16 +50,21 @@ jobs:
       fail-fast: false
       matrix:
         toolchain: ["1.95", stable]
-    services:
-      nats:
-        image: nats:2
-        ports:
-          - 4222:4222
-        options: --entrypoint "" nats:2 nats-server -js
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # Not a service container: those cannot pass arguments to the image, and
+      # JetStream needs `-js`. Fails the job if the broker does not come up.
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2 -js -m 8222
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:8222/healthz?js-enabled-only=true" && exit 0
+            sleep 1
+          done
+          docker logs nats
+          exit 1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.toolchain }}

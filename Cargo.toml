@@ -22,7 +22,7 @@ zstd = ["compression", "dep:zstd"]
 metrics = ["dep:metrics"]
 
 [dependencies]
-async-nats = { version = "0.50", optional = true, default-features = false, features = ["ring", "jetstream", "nkeys", "nuid", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
+async-nats = { version = "0.52", optional = true, default-features = false, features = ["ring", "jetstream", "nkeys", "nuid", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
 bytes = "1"
 flate2 = { version = "1", optional = true }
 futures = "0.3"

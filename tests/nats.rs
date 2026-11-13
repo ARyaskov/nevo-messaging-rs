@@ -548,40 +548,48 @@ async fn completed_handler_tasks_are_reaped_while_serving() {
 /// concurrently, so each pump must balance only its own residual. Under the old
 /// per-pump `store(0)`, the first pump to finish zeroed the shared counter while
 /// the second still held in-flight handlers, and its later reap wrapped the
-/// counter to `usize::MAX`.
+/// counter to `usize::MAX`. The handlers stagger their completions via the
+/// `ms` param (600/800/1000), so the observation point below — first handler
+/// reaped while the two later ones still run — is reached deterministically.
 #[tokio::test]
 async fn multi_router_drains_keep_the_retention_counter_balanced() {
     let url = require_nats!();
     let service_a = unique("user");
     let service_b = unique("user");
     let entered = Arc::new(AtomicU32::new(0));
-    let slow_router = |service: &str, ms: u64| {
+    let completed = Arc::new(AtomicU32::new(0));
+    let slow_router = |service: &str| {
         let entered = Arc::clone(&entered);
-        Router::new(service).route("user.slow", move |_ctx: Context, _p: Value| {
+        let completed = Arc::clone(&completed);
+        Router::new(service).route("user.slow", move |_ctx: Context, p: Value| {
             let entered = Arc::clone(&entered);
+            let completed = Arc::clone(&completed);
             async move {
                 entered.fetch_add(1, Ordering::SeqCst);
+                // The completion schedule comes from the params the test sends.
+                let ms = p.get("ms").and_then(Value::as_u64).unwrap_or(0);
                 tokio::time::sleep(Duration::from_millis(ms)).await;
+                completed.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, Error>(())
             }
         })
     };
     let server = NatsServer::builder()
-        .router(slow_router(&service_a, 600))
-        .router(slow_router(&service_b, 600))
+        .router(slow_router(&service_a))
+        .router(slow_router(&service_b))
         .servers([url.as_str()])
         .serve()
         .await
         .unwrap();
     let c = client(&url, "frontend").await;
-    // Three staggered in-flight handlers on the second router and nothing on
-    // the first, so the first pump ends its drain early while the second still
-    // holds residual handlers.
+    // Three in-flight handlers on the second router and nothing on the first,
+    // so the first pump ends its drain early while the second still holds
+    // residual handlers; their completions are staggered at 600/800/1000 ms.
     for ms in [600u64, 800, 1000] {
         let c = c.clone();
         let service = service_b.clone();
         tokio::spawn(async move {
-            let _ = c.emit(&service, "user.slow", &json!({"ms": ms})).await;
+            let _ = c.emit(&service, "user.slow", &json!({ "ms": ms })).await;
         });
     }
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -598,19 +606,30 @@ async fn multi_router_drains_keep_the_retention_counter_balanced() {
         let client = server.nats().client().clone();
         tokio::spawn(async move { client.drain().await })
     };
-    // Sample while the pumps drain concurrently.
-    let mut wrapped = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while tokio::time::Instant::now() < deadline {
-        if server.retained_tasks() == usize::MAX {
-            wrapped = true;
-            break;
+    // Managed sampling point: wait until the 600 ms handler has completed and
+    // been reaped while the 800/1000 ms handlers are still in flight. At that
+    // instant the shared counter must read exactly 2. Under the old per-pump
+    // `store(0)` the first pump's drain zeroed the shared counter and this reap
+    // wrapped it to `usize::MAX`, which never reads 2 — no transient poll.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while completed.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    assert!(
-        !wrapped,
+        while server.retained_tasks() == 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first slow handler was not reaped while the later handlers stayed in flight");
+    assert_ne!(
+        server.retained_tasks(),
+        usize::MAX,
         "shared retention counter wrapped during the multi-router drain"
+    );
+    assert_eq!(
+        server.retained_tasks(),
+        2,
+        "shared counter must be exactly the two still-running handlers"
     );
     // After both pumps finished their final accounting the counter is exactly zero.
     let _ = drain.await;

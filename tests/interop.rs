@@ -26,6 +26,11 @@ fn interop_dir() -> PathBuf {
         .join("interop")
 }
 
+// Scope note: this harness drives the PUBLISHED npm package
+// `@riaskov/nevo-messaging` 2.6.1 (pinned in tests/interop/package.json),
+// not the current TypeScript tree. A pass here is a legacy wire-compatibility
+// gate against 2.6.1 only and must NOT be cited as verifying the current TS
+// sources paired with this Rust revision.
 fn prerequisites() -> Option<String> {
     let url = std::env::var("NEVO_TEST_NATS_URL")
         .ok()

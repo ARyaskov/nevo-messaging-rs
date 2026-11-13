@@ -3,7 +3,9 @@
 
 #![cfg(feature = "nats")]
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -15,7 +17,7 @@ use nevo_messaging::filter::SubscriptionFilter;
 use nevo_messaging::health::{CheckResult, HealthKind, HealthRegistry};
 use nevo_messaging::resilience::RetryPolicy;
 use nevo_messaging::transport::nats::{
-    ConsumerSpec, PublishOptions, PullOptions, RequestManyOptions, StreamSpec,
+    ConsumerSpec, Nats, PublishOptions, PullOptions, RequestManyOptions, StreamSpec,
 };
 use nevo_messaging::wire::BigInt;
 use nevo_messaging::{
@@ -548,48 +550,81 @@ async fn completed_handler_tasks_are_reaped_while_serving() {
 /// concurrently, so each pump must balance only its own residual. Under the old
 /// per-pump `store(0)`, the first pump to finish zeroed the shared counter while
 /// the second still held in-flight handlers, and its later reap wrapped the
-/// counter to `usize::MAX`. The handlers stagger their completions via the
-/// `ms` param (600/800/1000), so the observation point below — first handler
-/// reaped while the two later ones still run — is reached deterministically.
+/// counter to `usize::MAX`. Gates hold every handler until the shared
+/// connection's drain has completed (async-nats' `Closed` event), so the
+/// observations below do not depend on completion timing: the test opens
+/// exactly one gate at a time.
 #[tokio::test]
 async fn multi_router_drains_keep_the_retention_counter_balanced() {
     let url = require_nats!();
     let service_a = unique("user");
     let service_b = unique("user");
     let entered = Arc::new(AtomicU32::new(0));
-    let completed = Arc::new(AtomicU32::new(0));
+    // One gate per handler: a handler parks on its receiver until the test
+    // opens it, so completions and reaps happen one at a time in the order the
+    // test chooses instead of on a wall-clock schedule.
+    let gates: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Receiver<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let slow_router = |service: &str| {
         let entered = Arc::clone(&entered);
-        let completed = Arc::clone(&completed);
+        let gates = Arc::clone(&gates);
         Router::new(service).route("user.slow", move |_ctx: Context, p: Value| {
             let entered = Arc::clone(&entered);
-            let completed = Arc::clone(&completed);
+            let gates = Arc::clone(&gates);
             async move {
                 entered.fetch_add(1, Ordering::SeqCst);
-                // The completion schedule comes from the params the test sends.
-                let ms = p.get("ms").and_then(Value::as_u64).unwrap_or(0);
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                completed.fetch_add(1, Ordering::SeqCst);
+                // Take this handler's gate before parking on it; the lock is
+                // never held across the await.
+                let i = p.get("i").and_then(Value::as_u64).unwrap_or(u64::MAX);
+                let gate = gates.lock().unwrap().remove(&i);
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
                 Ok::<_, Error>(())
             }
         })
     };
+    // The test owns the server connection so it can observe the drain's real
+    // end: Client::drain() only enqueues its command (async-nats 0.52
+    // `client.rs`), while the connection handler emits `Closed` after flushing
+    // the UNSUB/PING ops and dropping every subscription channel.
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let server_client = async_nats::ConnectOptions::new()
+        .event_callback({
+            let closed = Arc::clone(&closed);
+            move |event| {
+                let closed = Arc::clone(&closed);
+                async move {
+                    if matches!(event, async_nats::Event::Closed) {
+                        closed.notify_one();
+                    }
+                }
+            }
+        })
+        .connect(url.clone())
+        .await
+        .expect("server client connection failed");
     let server = NatsServer::builder()
         .router(slow_router(&service_a))
         .router(slow_router(&service_b))
-        .servers([url.as_str()])
-        .serve()
+        .serve_with(Nats::from_client(server_client))
         .await
         .unwrap();
     let c = client(&url, "frontend").await;
     // Three in-flight handlers on the second router and nothing on the first,
     // so the first pump ends its drain early while the second still holds
-    // residual handlers; their completions are staggered at 600/800/1000 ms.
-    for ms in [600u64, 800, 1000] {
+    // residual handlers, all parked on their gates.
+    let mut gate_openers = Vec::new();
+    for i in 0..3u64 {
+        let (opener, parked) = tokio::sync::oneshot::channel();
+        gates.lock().unwrap().insert(i, parked);
+        gate_openers.push(opener);
+    }
+    for i in 0..3u64 {
         let c = c.clone();
         let service = service_b.clone();
         tokio::spawn(async move {
-            let _ = c.emit(&service, "user.slow", &json!({ "ms": ms })).await;
+            let _ = c.emit(&service, "user.slow", &json!({ "i": i })).await;
         });
     }
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -602,25 +637,45 @@ async fn multi_router_drains_keep_the_retention_counter_balanced() {
     assert_eq!(server.retained_tasks(), 3);
     // End both pumps by draining the shared connection (what a shutdown would
     // close); the server object stays alive so its counter remains observable.
-    let drain = {
-        let client = server.nats().client().clone();
-        tokio::spawn(async move { client.drain().await })
-    };
-    // Managed sampling point: wait until the 600 ms handler has completed and
-    // been reaped while the 800/1000 ms handlers are still in flight. At that
-    // instant the shared counter must read exactly 2. Under the old per-pump
-    // `store(0)` the first pump's drain zeroed the shared counter and this reap
-    // wrapped it to `usize::MAX`, which never reads 2 — no transient poll.
+    server
+        .nats()
+        .client()
+        .drain()
+        .await
+        .expect("shared client drain failed");
+    // Handshake: wait for the drain's actual completion. The enqueue-only
+    // `drain()` return proves nothing; `Closed` fires only after the
+    // connection handler flushed the UNSUB/PING ops and dropped every
+    // subscription channel, so both pumps have been told to stop serving
+    // before the first gate opens.
+    tokio::time::timeout(Duration::from_secs(5), closed.notified())
+        .await
+        .expect("drained connection never emitted the Closed event");
+    // shortcut: async-nats 0.52 exposes no observable for a pump task's final
+    // accounting (its post-join-loop decrement), so the store(0) regression is
+    // only caught when that accounting lands before the observed reaps;
+    // upgrade when NatsServer exposes per-pump join handles.
+    // With the drain fully complete and every handler still gated, the empty
+    // pump's correct accounting subtracts only its own zero residual, so the
+    // shared counter must still read exactly 3.
+    assert_eq!(
+        server.retained_tasks(),
+        3,
+        "the empty pump's drain accounting must not touch the active pump's share"
+    );
+    // Open exactly one gate and wait for that single reap: the two remaining
+    // handlers stay parked, so the counter can only move from 3 to 2. Under the
+    // old per-pump `store(0)` the empty pump's zeroing raced these reaps; when
+    // it lands first the reap wraps the counter to `usize::MAX` and the wait
+    // below never sees 2.
+    gate_openers.remove(0).send(()).ok();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while completed.load(Ordering::SeqCst) < 1 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        while server.retained_tasks() == 3 {
+        while server.retained_tasks() != 2 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("first slow handler was not reaped while the later handlers stayed in flight");
+    .expect("the single released handler was not reaped while the others stayed gated");
     assert_ne!(
         server.retained_tasks(),
         usize::MAX,
@@ -631,8 +686,11 @@ async fn multi_router_drains_keep_the_retention_counter_balanced() {
         2,
         "shared counter must be exactly the two still-running handlers"
     );
-    // After both pumps finished their final accounting the counter is exactly zero.
-    let _ = drain.await;
+    // Open the remaining gates; after both pumps finish their final accounting
+    // the counter is exactly zero.
+    for opener in gate_openers {
+        opener.send(()).ok();
+    }
     tokio::time::timeout(Duration::from_secs(5), async {
         while server.retained_tasks() != 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;

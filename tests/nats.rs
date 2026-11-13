@@ -445,7 +445,8 @@ async fn idempotency_keys_deduplicate_on_both_sides() {
         "server replays the stored response"
     );
 
-    c.response_cache().clear();
+    // Same key, different params: the client cache now fingerprints the params and
+    // surfaces the conflict without another server call.
     let conflict = c
         .query_with::<_, User>(
             &service,
@@ -458,8 +459,46 @@ async fn idempotency_keys_deduplicate_on_both_sides() {
         .await
         .unwrap_err();
     assert_eq!(conflict.code(), ErrorCode::IdempotencyKeyConflict);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the conflicting request never reached the handler"
+    );
     c.close(Duration::from_secs(1)).await.unwrap();
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_drains_an_accepted_inflight_request() {
+    let url = require_nats!();
+    let service = unique("user");
+    let server = NatsServer::bind(user_router(&service, Arc::default()), [url.as_str()])
+        .await
+        .unwrap();
+    let c = client(&url, "frontend").await;
+    let empty = json!({});
+    let pending = c.query::<_, Value>(&service, "user.slow", &empty);
+    tokio::pin!(pending);
+    // Wait until the pump has registered the accepted request. Registration
+    // happens at spawn time, before any handler work, so once the count is
+    // observable, shutdown must wait for this handler.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.routers()[0].inflight().count() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("pump did not register the accepted request in time");
+    // Pins the drain guarantee plus single registration on the current code:
+    // not a discriminator against the old double-track race, which could pass
+    // this point before its dispatcher-side registration became visible.
+    assert_eq!(server.routers()[0].inflight().count(), 1);
+    // Shutdown must drain: the reply is published before the connection closes.
+    let shutdown = tokio::spawn(server.shutdown());
+    let late = pending.await.unwrap();
+    assert_eq!(late, json!("late"));
+    shutdown.await.unwrap().unwrap();
+    c.close(Duration::from_secs(1)).await.unwrap();
 }
 
 #[tokio::test]

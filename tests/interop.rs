@@ -212,7 +212,7 @@ async fn typescript_and_rust_peers_interoperate() {
     assert_eq!(error["field"], "id");
 
     let echo = peer.expect("echo").await;
-    assert_eq!(echo["echoed"]["params"]["s"], "5n");
+    assert_eq!(echo["echoed"]["params"]["s"], "@@nevo:bigint:5");
     assert_eq!(echo["echoed"]["params"]["n"], "2n");
     assert_eq!(echo["echoed"]["caller"], "ts-caller");
     assert_eq!(echo["echoed"]["tenant"], "t1");
@@ -287,11 +287,12 @@ async fn typescript_and_rust_peers_interoperate() {
         .query(
             &ts_service,
             "user.echo",
-            &json!({"s": "@@nevo:str:x", "n": 1}),
+            &json!({"s": "@@nevo:str:x", "sentinel": "@@nevo:bigint:5", "n": 1}),
         )
         .await
         .unwrap();
     assert_eq!(echoed["s"], "@@nevo:str:x");
+    assert_eq!(echoed["sentinel"], "@@nevo:bigint:5");
     assert_eq!(echoed["n"], 1);
 
     let err = client

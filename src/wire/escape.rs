@@ -25,9 +25,11 @@ pub fn may_contain_sentinel(bytes: &[u8]) -> bool {
     memchr::memmem::find(bytes, SENTINEL_PREFIX.as_bytes()).is_some()
 }
 
-/// A well-formed `@@nevo:bigint:<digits>` literal. Such strings travel unescaped even
-/// when they come from a dynamic value, so a [`BigInt`](super::BigInt) embedded in a
-/// `serde_json::Value` still reaches the peer as a bigint.
+/// A well-formed `@@nevo:bigint:<digits>` literal. Only the [`BigInt`](super::BigInt)
+/// newtype path emits such literals unescaped; an ordinary string value with this
+/// shape is escaped like any other sentinel-prefixed string. Production code no
+/// longer calls this (escaping is byte-scan based); kept public for wire-parity
+/// checks and tests.
 pub fn is_bigint_sentinel(value: &str) -> bool {
     value
         .strip_prefix(BIGINT_SENTINEL)
@@ -147,7 +149,9 @@ impl<S: Serializer> Serializer for Escaping<S> {
     }
 
     fn serialize_str(self, v: &str) -> Result<S::Ok, S::Error> {
-        if self.escape && v.starts_with(SENTINEL_PREFIX) && !is_bigint_sentinel(v) {
+        // Every sentinel-shaped string travels escaped, exactly like the
+        // TypeScript sender; real BigInts take the unescaped newtype path.
+        if self.escape && v.starts_with(SENTINEL_PREFIX) {
             let mut escaped = String::with_capacity(STRING_ESCAPE.len() + v.len());
             escaped.push_str(STRING_ESCAPE);
             escaped.push_str(v);
@@ -877,16 +881,32 @@ mod tests {
         assert_eq!(from_json::<Kind>("\"Unit\""), Kind::Unit);
     }
 
+    /// A BigInt embedded in a `serde_json::Value` degrades to its string form, which
+    /// travels escaped like any user string; only the typed newtype path is unescaped.
     #[test]
-    fn dynamic_bigint_sentinels_pass_through() {
+    fn value_strings_and_literal_sentinels_are_escaped() {
         let value = serde_json::json!({"id": BigInt::from(7u8), "neg": "@@nevo:bigint:-3", "text": "@@nevo:bigint:"});
         let json = to_json(&value);
-        assert!(json.contains("\"id\":\"@@nevo:bigint:7\""));
-        assert!(json.contains("\"neg\":\"@@nevo:bigint:-3\""));
+        assert!(json.contains("\"id\":\"@@nevo:str:@@nevo:bigint:7\""));
+        assert!(json.contains("\"neg\":\"@@nevo:str:@@nevo:bigint:-3\""));
         assert!(json.contains("\"text\":\"@@nevo:str:@@nevo:bigint:\""));
         assert!(is_bigint_sentinel("@@nevo:bigint:0"));
         assert!(!is_bigint_sentinel("@@nevo:bigint:1n"));
         assert!(!is_bigint_sentinel("@@nevo:str:1"));
+    }
+
+    /// A literal sentinel string must survive the wire as a string, never as a bigint.
+    #[test]
+    fn bigint_sentinel_strings_round_trip_as_strings() {
+        let json = to_json(&"@@nevo:bigint:5");
+        assert_eq!(json, "\"@@nevo:str:@@nevo:bigint:5\"");
+        let back: String = from_json(&json);
+        assert_eq!(back, "@@nevo:bigint:5");
+        // The typed BigInt path still emits the unescaped sentinel.
+        let typed = to_json(&BigInt::from(5u8));
+        assert_eq!(typed, "\"@@nevo:bigint:5\"");
+        let parsed: BigInt = from_json(&typed);
+        assert_eq!(parsed.as_str(), "5");
     }
 
     #[test]

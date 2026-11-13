@@ -161,6 +161,7 @@ impl NatsServer {
                 subscriber,
                 stop.subscribe(),
                 config.concurrency,
+                config.drain_timeout,
             )));
         }
         Ok(Self {
@@ -183,12 +184,16 @@ impl NatsServer {
 
     /// Stops accepting requests, waits for handlers to finish, then closes an owned connection.
     pub async fn shutdown(self) -> Result<()> {
+        // Reject new work before the pumps stop, so anything already accepted is drained.
+        for router in &self.routers {
+            router.inflight().begin_shutdown();
+        }
         let _ = self.stop.send(true);
         for pump in self.pumps {
+            // Each pump joins its accepted handlers before returning.
             let _ = pump.await;
         }
         for router in &self.routers {
-            router.inflight().begin_shutdown();
             if !router.inflight().drain(self.config.drain_timeout).await {
                 tracing::warn!(
                     event = "nats.router.drain_timeout",
@@ -217,8 +222,10 @@ async fn pump(
     mut subscriber: async_nats::Subscriber,
     mut stop: watch::Receiver<bool>,
     concurrency: usize,
+    drain_timeout: Duration,
 ) {
     let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut accepted = tokio::task::JoinSet::new();
     loop {
         let message = tokio::select! {
             biased;
@@ -231,10 +238,17 @@ async fn pump(
         let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
             break;
         };
+        // Once shutdown began, stop accepting new work; pending messages are dropped.
+        if router.inflight().is_shutting_down() {
+            continue;
+        }
         let router = Arc::clone(&router);
         let client = client.clone();
-        tokio::spawn(async move {
+        accepted.spawn(async move {
             let _permit = permit;
+            // Registered at spawn time, before any handler work, so a shutdown
+            // racing this task still waits for the reply to be published.
+            let _guard = router.inflight().enter();
             let reply = message.reply.clone();
             let outbound = router.handle(from_message(message)).await;
             let Some(reply) = reply else {
@@ -254,4 +268,18 @@ async fn pump(
         });
     }
     let _ = subscriber.unsubscribe().await;
+    // Drain the accepted handlers by their owned handles, bounded by the drain timeout.
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, accepted.join_next()).await {
+            Ok(Some(result)) => {
+                if let Err(err) = result {
+                    tracing::warn!(event = "nats.handler_join_failed", error = %err);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    accepted.abort_all();
 }

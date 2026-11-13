@@ -27,6 +27,7 @@ use crate::metrics;
 use crate::resilience::{
     CircuitBreaker, CircuitBreakerConfig, HedgePolicy, RetryPolicy, hedge, with_retry,
 };
+use crate::server::fingerprint;
 use crate::shutdown::Inflight;
 use crate::time::unix_millis;
 use crate::transport::{Inbound, Outbound, Transport};
@@ -233,6 +234,8 @@ pub struct Encoded {
     pub method: String,
     pub meta: Meta,
     pub payload: Bytes,
+    /// Uncompressed envelope bytes, as encoded by the client's codec.
+    pub raw: Bytes,
     pub encoding: Encoding,
 }
 
@@ -321,7 +324,7 @@ impl Core {
                 self.config.max_payload_bytes,
             ));
         }
-        let (payload, encoding) = compress(raw, &self.config.compression)?;
+        let (payload, encoding) = compress(raw.clone(), &self.config.compression)?;
         metrics::observe(
             metrics::PAYLOAD_BYTES,
             vec![
@@ -340,6 +343,7 @@ impl Core {
             method: versioned,
             meta,
             payload,
+            raw,
             encoding,
         })
     }
@@ -660,9 +664,26 @@ impl<T: Transport> Client<T> {
             .as_deref()
             .filter(|_| core.cache.is_enabled())
             .map(|k| client_key(&service, method, k));
+        // Fingerprint the params exactly as the server does; uuid and meta never
+        // enter the hash, so this can be computed from a local encode of the call.
+        let fingerprint = match &cache_key {
+            Some(_) => {
+                let probe = core.encode_request(method, params, MessageType::Query, &opts)?;
+                fingerprint::of_params(core.config.codec, &probe.raw)
+            }
+            None => None,
+        };
         if let Some(key) = &cache_key
             && let Some(entry) = core.cache.get(key)
         {
+            if entry.fingerprint.as_deref() != fingerprint.as_deref() {
+                return Err(Error::new(
+                    ErrorCode::IdempotencyKeyConflict,
+                    format!(
+                        "Idempotency key was already used for a different request payload on {method}"
+                    ),
+                ));
+            }
             return Core::unwrap_response(entry.codec, &entry.payload, &service);
         }
 
@@ -685,6 +706,7 @@ impl<T: Transport> Client<T> {
                 .insert(HEADER_ATTEMPT.to_owned(), attempt.to_string());
             let service = service.clone();
             let cache_key = cache_key.clone();
+            let fingerprint = fingerprint.clone();
             async move {
                 let encoded = core.encode_request(method, params, MessageType::Query, &call)?;
                 let span = tracing::debug_span!(
@@ -707,7 +729,7 @@ impl<T: Transport> Client<T> {
                         IdempotencyEntry {
                             codec,
                             payload: raw,
-                            fingerprint: None,
+                            fingerprint,
                         },
                     );
                 }

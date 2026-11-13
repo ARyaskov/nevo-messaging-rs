@@ -57,11 +57,18 @@ methods, error propagation, compression in both directions, `emit`, `publish`
   `production`, error details are reduced to the public keys and did-you-mean
   hints are suppressed, matching the TypeScript behaviour. Override with
   `Router::expose_errors`.
-- **Strings that look like bigints.** A string equal to
-  `@@nevo:bigint:<digits>` sent from Rust arrives on the TypeScript side as a
-  `bigint`. The TypeScript side escapes such strings; Rust does not, so that
-  `json!({"id": BigInt::from(1)})` keeps working. Use typed structs when the
-  distinction matters.
+- **Strings that look like bigints.** Both sides escape any string that starts
+  with `@@nevo:` when serializing, so `"@@nevo:bigint:5"` travels as
+  `"@@nevo:str:@@nevo:bigint:5"` and arrives as the same string. Only the typed
+  `BigInt` path emits the unescaped `@@nevo:bigint:<digits>` sentinel, so the
+  TypeScript peer receives a `bigint`. A `BigInt` wrapped inside a
+  `serde_json::Value` (e.g. `json!({"id": BigInt::from(1)})`) does **not** use
+  the typed path: serde_json erases the newtype, the value degrades to a
+  `"@@nevo:str:@@nevo:bigint:7"` string, and the peer receives that string. This
+  is an intentional breaking wire change: old-Rust senders relying on a literal
+  sentinel string now get it back escaped (new-Rust to old-TS is safe, since
+  `@@nevo:str:` is unescaped on the TS side too); a plain string can no longer
+  be mistaken for an encoded bigint.
 
 ## Not ported (yet)
 

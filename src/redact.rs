@@ -34,12 +34,19 @@ const EXACT_KEYS: &[&str] = &[
     "cvv",
 ];
 
-const SUBSTRINGS: &[&str] = &[
+/// Secret-naming suffixes: credential keys end with one of these words
+/// (`accessToken`, `sessionCookie`, `private_key`), or contain one and end with
+/// a secret-carrying tail (`passwordHash`, `apiKeyValue`, `my_token_value`).
+/// Diagnostic fields that merely contain a word (`tokenCount`, `tokenizer`,
+/// `tokens`) never end in a secret word or tail, so they stay visible.
+const SUFFIXES: &[&str] = &[
     "password",
     "passwd",
     "secret",
     "token",
+    "cookies",
     "cookie",
+    "credentials",
     "credential",
     "bearer",
     "apikey",
@@ -59,13 +66,20 @@ const SUBSTRINGS: &[&str] = &[
     "encryption_key",
 ];
 
+/// Compound-secret tails: `passwordHash`, `apiKeyValue`, `secretKey` still
+/// redact, while `tokenCount`/`tokenizer`/`tokens` do not end in one.
+const COMPOUND_TAILS: &[&str] = &["key", "hash", "value", "digest"];
+
 const MAX_DEPTH: usize = 512;
 
 pub fn is_sensitive_key(key: &str, extra_keys: &[String]) -> bool {
     let lower = key.to_ascii_lowercase();
     EXACT_KEYS.contains(&lower.as_str())
         || extra_keys.iter().any(|k| k.eq_ignore_ascii_case(&lower))
-        || SUBSTRINGS.iter().any(|s| lower.contains(s))
+        || SUFFIXES.iter().any(|s| {
+            lower.ends_with(s)
+                || (lower.contains(s) && COMPOUND_TAILS.iter().any(|t| lower.ends_with(t)))
+        })
 }
 
 /// Replaces values under sensitive keys with [`REDACTED`], in place.
@@ -142,6 +156,48 @@ mod tests {
         assert_eq!(out["user"]["sortKey"], "k");
         assert_eq!(out["list"][0]["api_key"], REDACTED);
         assert_eq!(out["custom"], REDACTED);
+    }
+
+    #[test]
+    fn diagnostic_keys_with_sensitive_words_stay_visible() {
+        let value = json!({
+            "tokenCount": 3,
+            "tokenizer": "bpe",
+            "tokens": ["a"],
+            "accessToken": "s",
+            "refreshToken": "r",
+            "sessionCookie": "c",
+        });
+        let out = redacted(value, &[]);
+        assert_eq!(out["tokenCount"], 3);
+        assert_eq!(out["tokenizer"], "bpe");
+        assert_eq!(out["tokens"], json!(["a"]));
+        assert_eq!(out["accessToken"], REDACTED);
+        assert_eq!(out["refreshToken"], REDACTED);
+        assert_eq!(out["sessionCookie"], REDACTED);
+    }
+
+    #[test]
+    fn compound_secret_keys_still_redact() {
+        let value = json!({
+            "passwordHash": "h",
+            "accessTokenValue": "v",
+            "my_token_value": "t",
+            "secretKey": "k",
+            "secret_key": "k",
+            "apiKeyValue": "a",
+        });
+        let out = redacted(value, &[]);
+        for key in [
+            "passwordHash",
+            "accessTokenValue",
+            "my_token_value",
+            "secretKey",
+            "secret_key",
+            "apiKeyValue",
+        ] {
+            assert_eq!(out[key], REDACTED, "key `{key}` must stay redacted");
+        }
     }
 
     #[test]

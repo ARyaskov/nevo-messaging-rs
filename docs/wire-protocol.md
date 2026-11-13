@@ -64,9 +64,15 @@ Both codecs report `is_human_readable() == true`, values and map keys alike:
 MessagePack is used here as a compact JSON, and a JavaScript peer expects a
 `uuid` to be a string, never sixteen bytes.
 
-A well-formed `@@nevo:bigint:<digits>` string is never escaped, so a `BigInt`
-embedded in a `serde_json::Value` (for example via `json!`) still arrives as a
-bigint. A `serde_json::Value` received from a TypeScript `bigint` is the raw
+Only the typed `BigInt` newtype emits an unescaped `@@nevo:bigint:<digits>`
+sentinel. A well-formed `@@nevo:bigint:<digits>` **string** is now escaped like
+any other sentinel-prefixed string: a `BigInt` embedded in a
+`serde_json::Value` (for example via `json!`) degrades to an escaped string on
+the wire and arrives as a string, not a `bigint`. This is an intentional
+breaking wire change; peers that previously sent or expected raw sentinel
+strings must switch to the typed path (old-Rust literal-sentinel senders now
+round-trip as escaped strings, while new-Rust to old-TS stays safe). A
+`serde_json::Value` received from a TypeScript `bigint` is still the raw
 sentinel string; parse it with `BigInt::parse`.
 
 ## Compression

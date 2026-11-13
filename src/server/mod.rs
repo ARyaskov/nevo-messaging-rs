@@ -2,7 +2,7 @@
 //! rate limit → ACL → built-ins → idempotency claim → interceptors → handler,
 //! with dead-letter and metrics bookkeeping.
 
-mod fingerprint;
+pub(crate) mod fingerprint;
 mod suggest;
 
 use std::collections::HashMap;
@@ -700,9 +700,7 @@ impl Router {
             uuid = %uuid,
             caller = ctx.caller.as_deref().unwrap_or(""),
         );
-        let outcome = self
-            .inflight
-            .track((route.handler)(codec, raw.clone(), ctx.clone()))
+        let outcome = (route.handler)(codec, raw.clone(), ctx.clone())
             .instrument(span)
             .await;
 

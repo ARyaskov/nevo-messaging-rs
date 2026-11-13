@@ -54,10 +54,20 @@ impl IdempotencyConfig {
     }
 }
 
-pub fn client_key(service: &str, method: &str, idempotency_key: &str) -> String {
+/// Scoped like [`server_key`] from the caller's side: target service, tenant,
+/// the versioned method (so a version change never replays another version's
+/// response) and the idempotency key.
+pub fn client_key(
+    service: &str,
+    tenant: Option<&str>,
+    method: &str,
+    idempotency_key: &str,
+) -> String {
+    let tenant = tenant.unwrap_or("");
     format!(
-        "{}:{service}|{}:{method}|{idempotency_key}",
+        "{}:{service}|{}:{tenant}|{}:{method}|{idempotency_key}",
         service.len(),
+        tenant.len(),
         method.len()
     )
 }
@@ -422,7 +432,20 @@ mod tests {
 
     #[test]
     fn keys() {
-        assert_eq!(client_key("svc", "m", "k"), "3:svc|1:m|k");
+        assert_eq!(
+            client_key("svc", Some("t1"), "m@v1", "k"),
+            "3:svc|2:t1|4:m@v1|k"
+        );
+        assert_eq!(client_key("svc", None, "m@v1", "k"), "3:svc|0:|4:m@v1|k");
+        // Tenant and version changes must never surface another entry's response.
+        assert_ne!(
+            client_key("svc", Some("t1"), "m@v1", "k"),
+            client_key("svc", Some("t2"), "m@v1", "k")
+        );
+        assert_ne!(
+            client_key("svc", Some("t1"), "m@v1", "k"),
+            client_key("svc", Some("t1"), "m@v2", "k")
+        );
         assert_eq!(
             server_key(None, Some("t"), "m", None, "u").unwrap(),
             "0:|1:t|1:m|u"

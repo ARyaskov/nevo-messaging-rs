@@ -4,7 +4,7 @@
 #![cfg(feature = "nats")]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -472,33 +472,228 @@ async fn idempotency_keys_deduplicate_on_both_sides() {
 async fn shutdown_drains_an_accepted_inflight_request() {
     let url = require_nats!();
     let service = unique("user");
-    let server = NatsServer::bind(user_router(&service, Arc::default()), [url.as_str()])
-        .await
-        .unwrap();
+    // Independent handler-entry barrier: set inside the handler body, so the
+    // test fails (timeout) if the request future is never polled and the pump
+    // never accepts the request.
+    let entered = Arc::new(AtomicBool::new(false));
+    let handler_seen = Arc::clone(&entered);
+    let router = Router::new(&service).route("user.slow", move |_ctx: Context, _p: Value| {
+        let seen = Arc::clone(&handler_seen);
+        async move {
+            seen.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Ok::<_, Error>("late")
+        }
+    });
+    let server = NatsServer::bind(router, [url.as_str()]).await.unwrap();
     let c = client(&url, "frontend").await;
-    let empty = json!({});
-    let pending = c.query::<_, Value>(&service, "user.slow", &empty);
-    tokio::pin!(pending);
-    // Wait until the pump has registered the accepted request. Registration
-    // happens at spawn time, before any handler work, so once the count is
-    // observable, shutdown must wait for this handler.
+    // The request future runs concurrently; nothing below relies on the caller
+    // polling it from this task.
+    let pending = {
+        let c = c.clone();
+        let service = service.clone();
+        tokio::spawn(async move { c.query::<_, Value>(&service, "user.slow", &json!({})).await })
+    };
+    // Handler entry proves the pump accepted the request: the inflight guard is
+    // registered at spawn time, before any handler work.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while server.routers()[0].inflight().count() == 0 {
+        while !entered.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("pump did not register the accepted request in time");
-    // Pins the drain guarantee plus single registration on the current code:
-    // not a discriminator against the old double-track race, which could pass
-    // this point before its dispatcher-side registration became visible.
+    .expect("handler was never entered; the request future was not polled");
     assert_eq!(server.routers()[0].inflight().count(), 1);
     // Shutdown must drain: the reply is published before the connection closes.
     let shutdown = tokio::spawn(server.shutdown());
-    let late = pending.await.unwrap();
+    let late = pending.await.unwrap().unwrap();
     assert_eq!(late, json!("late"));
     shutdown.await.unwrap().unwrap();
     c.close(Duration::from_secs(1)).await.unwrap();
+}
+
+/// Regression discriminator for handler-task retention: drive requests without
+/// any shutdown and assert the pumps reap their completed tasks. With reaping
+/// only after the work loop exits, `retained_tasks` never returns to zero.
+#[tokio::test]
+async fn completed_handler_tasks_are_reaped_while_serving() {
+    let url = require_nats!();
+    let service = unique("user");
+    let calls = Arc::new(AtomicU32::new(0));
+    let server = NatsServer::bind(user_router(&service, calls.clone()), [url.as_str()])
+        .await
+        .unwrap();
+    let c = client(&url, "frontend").await;
+    for i in 0..10u32 {
+        let id = BigInt::parse(&i.to_string()).unwrap();
+        let user: User = c
+            .query(&service, "user.getById", &GetById { id })
+            .await
+            .unwrap();
+        assert_eq!(user.id.as_str(), i.to_string());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.retained_tasks() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("pump never reaped its completed handler tasks");
+    c.close(Duration::from_secs(1)).await.unwrap();
+    server.shutdown().await.unwrap();
+}
+
+/// Multi-router discriminator for the shared retention counter: two pumps drain
+/// concurrently, so each pump must balance only its own residual. Under the old
+/// per-pump `store(0)`, the first pump to finish zeroed the shared counter while
+/// the second still held in-flight handlers, and its later reap wrapped the
+/// counter to `usize::MAX`.
+#[tokio::test]
+async fn multi_router_drains_keep_the_retention_counter_balanced() {
+    let url = require_nats!();
+    let service_a = unique("user");
+    let service_b = unique("user");
+    let entered = Arc::new(AtomicU32::new(0));
+    let slow_router = |service: &str, ms: u64| {
+        let entered = Arc::clone(&entered);
+        Router::new(service).route("user.slow", move |_ctx: Context, _p: Value| {
+            let entered = Arc::clone(&entered);
+            async move {
+                entered.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok::<_, Error>(())
+            }
+        })
+    };
+    let server = NatsServer::builder()
+        .router(slow_router(&service_a, 600))
+        .router(slow_router(&service_b, 600))
+        .servers([url.as_str()])
+        .serve()
+        .await
+        .unwrap();
+    let c = client(&url, "frontend").await;
+    // Three staggered in-flight handlers on the second router and nothing on
+    // the first, so the first pump ends its drain early while the second still
+    // holds residual handlers.
+    for ms in [600u64, 800, 1000] {
+        let c = c.clone();
+        let service = service_b.clone();
+        tokio::spawn(async move {
+            let _ = c.emit(&service, "user.slow", &json!({"ms": ms})).await;
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("slow handlers were never entered");
+    assert_eq!(server.retained_tasks(), 3);
+    // End both pumps by draining the shared connection (what a shutdown would
+    // close); the server object stays alive so its counter remains observable.
+    let drain = {
+        let client = server.nats().client().clone();
+        tokio::spawn(async move { client.drain().await })
+    };
+    // Sample while the pumps drain concurrently.
+    let mut wrapped = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if server.retained_tasks() == usize::MAX {
+            wrapped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        !wrapped,
+        "shared retention counter wrapped during the multi-router drain"
+    );
+    // After both pumps finished their final accounting the counter is exactly zero.
+    let _ = drain.await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.retained_tasks() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("counter did not return to zero after both pumps drained");
+    c.close(Duration::from_secs(1)).await.unwrap();
+}
+
+/// Same params and idempotency key under a different tenant, or a different
+/// method version, must be cache misses rather than replays.
+#[tokio::test]
+async fn idempotency_cache_is_scoped_by_tenant_and_version() {
+    let url = require_nats!();
+    let service = unique("user");
+    let calls = Arc::new(AtomicU32::new(0));
+    let server = NatsServer::bind(user_router(&service, calls.clone()), [url.as_str()])
+        .await
+        .unwrap();
+    let c = client(&url, "frontend").await;
+    let params = GetById {
+        id: BigInt::from(5u8),
+    };
+    let t1: User = c
+        .query_with(
+            &service,
+            "user.getById",
+            &params,
+            CallOptions::new().idempotency_key("k").tenant_id("t1"),
+        )
+        .await
+        .unwrap();
+    let t2: User = c
+        .query_with(
+            &service,
+            "user.getById",
+            &params,
+            CallOptions::new().idempotency_key("k").tenant_id("t2"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t1, t2);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "tenant change is a cache miss"
+    );
+    assert_eq!(
+        c.response_cache().len(),
+        2,
+        "tenant change inserted a new entry"
+    );
+    // A version change is a different method; a replay of the t1 user response
+    // would carry no "version" member and fail this assertion.
+    let v2: Value = c
+        .query_with(
+            &service,
+            "user.getById",
+            &params,
+            CallOptions::new()
+                .idempotency_key("k")
+                .tenant_id("t1")
+                .version("v2"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v2["version"], 2);
+    assert_eq!(
+        c.response_cache().len(),
+        3,
+        "version change inserted a new entry"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "only the tenant miss reached the handler"
+    );
+    c.close(Duration::from_secs(1)).await.unwrap();
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]

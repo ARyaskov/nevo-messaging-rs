@@ -104,6 +104,20 @@ struct GetById {
     id: BigInt,
 }
 
+/// Typed response so the Rust -> TypeScript direction exercises the typed
+/// `BigInt` newtype path, which emits the unescaped `@@nevo:bigint:<digits>`
+/// sentinel and decodes to a JavaScript `bigint`.
+#[derive(Debug, Serialize, Deserialize)]
+struct RsUser {
+    id: BigInt,
+    name: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    uid: uuid::Uuid,
+    tags: Vec<String>,
+    big: BigInt,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct User {
     id: BigInt,
@@ -122,17 +136,22 @@ struct User {
 fn rust_router(service: &str, audits: Arc<AtomicU32>) -> Router {
     Router::new(service)
         .route("user.getById", |_ctx: Context, p: GetById| async move {
-            Ok(json!({
-                "id": p.id,
-                "uid": uuid::Uuid::new_v4(),
-                "name": "Rust Eddie",
-                "createdAt": "2026-01-02T03:04:05.000Z",
-                "tags": ["@@nevo:tricky", "plain"],
-                "big": BigInt::parse("1180591620717411303425").unwrap(),
-            }))
+            Ok(RsUser {
+                id: p.id,
+                uid: uuid::Uuid::new_v4(),
+                name: "Rust Eddie".into(),
+                created_at: "2026-01-02T03:04:05.000Z".into(),
+                tags: vec!["@@nevo:tricky".into(), "plain".into()],
+                big: BigInt::parse("1180591620717411303425").unwrap(),
+            })
         })
         .route("user.getById@v2", |_ctx: Context, p: GetById| async move {
             Ok(json!({"id": p.id, "version": 2}))
+        })
+        .route("user.valueBigint", |_ctx: Context, _p: Value| async move {
+            // Documented degradation: a BigInt inside a serde_json::Value never
+            // takes the typed wire path; the peer must see the escaped string.
+            Ok(json!({"n": BigInt::from(5u8)}))
         })
         .route("user.echo", |ctx: Context, p: Value| async move {
             Ok(json!({
@@ -213,12 +232,21 @@ async fn typescript_and_rust_peers_interoperate() {
 
     let echo = peer.expect("echo").await;
     assert_eq!(echo["echoed"]["params"]["s"], "@@nevo:bigint:5");
-    assert_eq!(echo["echoed"]["params"]["n"], "2n");
+    // The TypeScript `2n` arrived inside dynamic params and degrades to its raw
+    // sentinel string; it returns as a string, never as a `2n` bigint.
+    assert_eq!(echo["echoed"]["params"]["n"], "@@nevo:bigint:2");
     assert_eq!(echo["echoed"]["caller"], "ts-caller");
     assert_eq!(echo["echoed"]["tenant"], "t1");
     assert_eq!(echo["echoed"]["header"], "v");
     assert_eq!(echo["echoed"]["idempotencyKey"], "k-1");
     assert_eq!(echo["echoed"]["attempt"], "1");
+
+    // Explicit pin for the documented dynamic-Value degradation: a BigInt
+    // embedded in a serde_json::Value travels escaped and the peer receives the
+    // degraded string, never a bigint.
+    let value_big = peer.expect("value-bigint").await;
+    assert_eq!(value_big["n"], "@@nevo:bigint:5");
+    assert_eq!(value_big["nType"], "string");
 
     let contract = peer.expect("contract").await;
     assert_eq!(contract["protocol"], "1");

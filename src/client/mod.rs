@@ -659,11 +659,20 @@ impl<T: Transport> Client<T> {
         let core = &self.inner.core;
         let transport = &self.inner.transport;
         let timeout = opts.timeout.unwrap_or(core.config.timeout);
+        // The cache key matches the server key's scope: target service, tenant,
+        // versioned method and the idempotency key, so a tenant or version
+        // change is always a miss instead of a replay.
+        let versioned_method = method::with_version(
+            method,
+            opts.version
+                .as_deref()
+                .unwrap_or(&core.config.default_version),
+        );
         let cache_key = opts
             .idempotency_key
             .as_deref()
             .filter(|_| core.cache.is_enabled())
-            .map(|k| client_key(&service, method, k));
+            .map(|k| client_key(&service, opts.tenant_id.as_deref(), &versioned_method, k));
         // Fingerprint the params exactly as the server does; uuid and meta never
         // enter the hash, so this can be computed from a local encode of the call.
         let fingerprint = match &cache_key {

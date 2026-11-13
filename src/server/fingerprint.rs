@@ -208,9 +208,21 @@ struct ParamsOnly {
     params: Fingerprint,
 }
 
+/// Decodes without the wire's `@@nevo:str:` unescaping pass. The fingerprint
+/// hashes the params exactly as they sit on the wire, so a typed `BigInt`'s
+/// unescaped `@@nevo:bigint:<digits>` sentinel and a user string carrying that
+/// same literal (wire form `@@nevo:str:...`) never collide.
+fn raw_decode<D: serde::de::DeserializeOwned>(codec: Codec, raw: &[u8]) -> Option<D> {
+    match codec {
+        #[cfg(feature = "msgpack")]
+        Codec::MsgPack => rmp_serde::from_slice(raw).ok(),
+        Codec::Json => serde_json::from_slice(raw).ok(),
+    }
+}
+
 /// Fingerprints the `params` member of a raw request envelope.
 pub fn of_params(codec: Codec, raw: &[u8]) -> Option<String> {
-    codec.decode::<ParamsOnly>(raw).ok().map(|p| p.params.0)
+    raw_decode::<ParamsOnly>(codec, raw).map(|p| p.params.0)
 }
 
 #[cfg(test)]
@@ -265,5 +277,52 @@ mod tests {
         // A differently valued payload must still be distinguishable.
         let changed = br#"{"uuid":"u","method":"m","params":{"a":1,"b":3,"c":{"x":1,"y":2}}}"#;
         assert_ne!(a, of_params(Codec::Json, changed).unwrap());
+    }
+
+    /// The client edge case: a typed `BigInt(5)` and a user string carrying the
+    /// literal `@@nevo:bigint:5` must produce different fingerprints on both codecs.
+    #[test]
+    fn typed_bigint_and_literal_sentinel_params_fingerprint_differ() {
+        #[derive(serde::Serialize)]
+        struct Typed {
+            id: crate::wire::BigInt,
+        }
+        #[derive(serde::Serialize)]
+        struct Literal {
+            id: String,
+        }
+        let typed = |codec: Codec| {
+            codec
+                .encode(&Request::new(
+                    "u",
+                    "m@v1",
+                    &Typed {
+                        id: crate::wire::BigInt::from(5u8),
+                    },
+                ))
+                .unwrap()
+        };
+        let literal = |codec: Codec| {
+            codec
+                .encode(&Request::new(
+                    "u",
+                    "m@v1",
+                    &Literal {
+                        id: "@@nevo:bigint:5".into(),
+                    },
+                ))
+                .unwrap()
+        };
+        let check = |codec: Codec| {
+            let a = of_params(codec, &typed(codec)).unwrap();
+            let b = of_params(codec, &literal(codec)).unwrap();
+            assert_ne!(
+                a, b,
+                "typed BigInt(5) collided with its literal string on {codec}"
+            );
+        };
+        check(Codec::Json);
+        #[cfg(feature = "msgpack")]
+        check(Codec::MsgPack);
     }
 }

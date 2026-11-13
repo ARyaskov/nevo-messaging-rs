@@ -1,6 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -40,6 +41,8 @@ pub struct NatsServer {
     pumps: Vec<JoinHandle<()>>,
     stop: watch::Sender<bool>,
     config: ServeConfig,
+    /// Accepted handler tasks spawned by the pumps but not yet reaped.
+    retained: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for NatsServer {
@@ -136,6 +139,7 @@ impl NatsServer {
         config: ServeConfig,
     ) -> Result<Self> {
         let (stop, _) = watch::channel(false);
+        let retained = Arc::new(AtomicUsize::new(0));
         let routers: Vec<Arc<Router>> = routers.into_iter().map(Arc::new).collect();
         let mut pumps = Vec::with_capacity(routers.len());
         for router in &routers {
@@ -162,6 +166,7 @@ impl NatsServer {
                 stop.subscribe(),
                 config.concurrency,
                 config.drain_timeout,
+                Arc::clone(&retained),
             )));
         }
         Ok(Self {
@@ -171,6 +176,7 @@ impl NatsServer {
             pumps,
             stop,
             config,
+            retained,
         })
     }
 
@@ -180,6 +186,14 @@ impl NatsServer {
 
     pub fn nats(&self) -> &Nats {
         &self.nats
+    }
+
+    /// Diagnostic count of accepted handler tasks the pumps have spawned but not
+    /// yet reaped. Completed tasks are reaped while the pump keeps serving, so
+    /// this stays near zero under steady traffic and is zero after a graceful
+    /// shutdown.
+    pub fn retained_tasks(&self) -> usize {
+        self.retained.load(Ordering::Relaxed)
     }
 
     /// Stops accepting requests, waits for handlers to finish, then closes an owned connection.
@@ -223,6 +237,7 @@ async fn pump(
     mut stop: watch::Receiver<bool>,
     concurrency: usize,
     drain_timeout: Duration,
+    retained: Arc<AtomicUsize>,
 ) {
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut accepted = tokio::task::JoinSet::new();
@@ -230,6 +245,15 @@ async fn pump(
         let message = tokio::select! {
             biased;
             _ = stop.changed() => break,
+            // Reap completed handlers while serving; with reaping only at
+            // shutdown, finished tasks would stay in the set forever.
+            Some(joined) = accepted.join_next() => {
+                retained.fetch_sub(1, Ordering::Relaxed);
+                if let Err(err) = joined {
+                    tracing::warn!(event = "nats.handler_join_failed", error = %err);
+                }
+                continue;
+            }
             next = subscriber.next() => match next {
                 Some(message) => message,
                 None => break,
@@ -244,6 +268,7 @@ async fn pump(
         }
         let router = Arc::clone(&router);
         let client = client.clone();
+        retained.fetch_add(1, Ordering::Relaxed);
         accepted.spawn(async move {
             let _permit = permit;
             // Registered at spawn time, before any handler work, so a shutdown
@@ -273,6 +298,7 @@ async fn pump(
     loop {
         match tokio::time::timeout_at(deadline, accepted.join_next()).await {
             Ok(Some(result)) => {
+                retained.fetch_sub(1, Ordering::Relaxed);
                 if let Err(err) = result {
                     tracing::warn!(event = "nats.handler_join_failed", error = %err);
                 }
@@ -282,4 +308,9 @@ async fn pump(
         }
     }
     accepted.abort_all();
+    // Aborted tasks remain in the set until joined, so `accepted.len()` is
+    // exactly this pump's spawned-but-unreaped residual; each was counted at
+    // spawn and never decremented. `fetch_sub` balances this pump alone without
+    // zeroing a sibling pump's share of the shared counter.
+    retained.fetch_sub(accepted.len(), Ordering::Relaxed);
 }

@@ -130,6 +130,9 @@ async function callRust(client) {
   )
   emit({ kind: "echo", echoed })
 
+  const valueBig = await client.query(rustService, "user.valueBigint", {})
+  emit({ kind: "value-bigint", n: valueBig.n, nType: typeof valueBig.n })
+
   await client.emit(rustService, "audit.write", { n: 1 })
   await client.publish(rustService, "order.placed", { n: 2 })
   await client.broadcast("system.status", { ok: true })

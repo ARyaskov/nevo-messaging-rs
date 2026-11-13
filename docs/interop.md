@@ -41,7 +41,10 @@ methods, error propagation, compression in both directions, `emit`, `publish`
   `meta.idempotencyKey` (falling back to the envelope uuid). A replay returns
   the stored response verbatim, including its original uuid. A reused key with
   a different payload answers `IDEMPOTENCY_KEY_CONFLICT`. The client also keeps
-  a response cache keyed by service, method and idempotency key.
+  a response cache keyed by service, tenant, versioned method and idempotency
+  key, so a tenant or version change is always a miss; its payload fingerprint
+  hashes the raw wire params, so a typed `BigInt` and a string carrying the
+  same `@@nevo:bigint:` literal never collide.
 - **Queue groups.** The TypeScript router subscribes without a queue group, so
   every instance receives every request. `NatsServerBuilder::queue_group`
   opts into load balancing; leave it unset for parity.

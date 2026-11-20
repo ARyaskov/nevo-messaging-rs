@@ -259,8 +259,13 @@ async fn pump(
                 None => break,
             },
         };
-        let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
-            break;
+        let permit = tokio::select! {
+            biased;
+            _ = stop.changed() => break,
+            permit = Arc::clone(&semaphore).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
         };
         // Once shutdown began, stop accepting new work; pending messages are dropped.
         if router.inflight().is_shutting_down() {
@@ -292,9 +297,9 @@ async fn pump(
             }
         });
     }
-    let _ = subscriber.unsubscribe().await;
-    // Drain the accepted handlers by their owned handles, bounded by the drain timeout.
+    // Unsubscription and handler drain share one deadline.
     let deadline = tokio::time::Instant::now() + drain_timeout;
+    let _ = tokio::time::timeout_at(deadline, subscriber.unsubscribe()).await;
     loop {
         match tokio::time::timeout_at(deadline, accepted.join_next()).await {
             Ok(Some(result)) => {

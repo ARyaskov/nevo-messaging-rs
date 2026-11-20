@@ -471,6 +471,43 @@ async fn idempotency_keys_deduplicate_on_both_sides() {
 }
 
 #[tokio::test]
+async fn shutdown_completes_with_a_saturated_handler_pool() {
+    let url = require_nats!();
+    let service = unique("saturated");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let handler_entered = Arc::clone(&entered);
+    let router = Router::new(&service).route("hold", move |_ctx: Context, _p: Value| {
+        let handler_entered = Arc::clone(&handler_entered);
+        async move {
+            handler_entered.notify_one();
+            std::future::pending::<Result<(), Error>>().await
+        }
+    });
+    let server = NatsServer::builder()
+        .router(router)
+        .servers([url.as_str()])
+        .concurrency(1)
+        .drain_timeout(Duration::from_millis(50))
+        .serve()
+        .await
+        .unwrap();
+    // Flush the subscription before publishing through the same connection.
+    server.nats().client().flush().await.unwrap();
+    let c = client(&url, "frontend").await;
+    c.emit(&service, "hold", &json!({})).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    c.emit(&service, "hold", &json!({})).await.unwrap();
+    c.nats().flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_drains_an_accepted_inflight_request() {
     let url = require_nats!();
     let service = unique("user");

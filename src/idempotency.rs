@@ -162,25 +162,22 @@ pub enum Claim {
 pub trait IdempotencyStore: Send + Sync + 'static {
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<IdempotencyEntry>>>;
 
+    /// Atomically reserve the key for this owner until the lease expires.
+    fn claim<'a>(
+        &'a self,
+        key: &'a str,
+        owner: uuid::Uuid,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<Claim>>;
+
+    /// Replace a live reservation with its result only if its owner matches.
     fn set<'a>(
         &'a self,
         key: &'a str,
+        owner: uuid::Uuid,
         entry: IdempotencyEntry,
         ttl: Duration,
-    ) -> BoxFuture<'a, Result<()>>;
-
-    /// Atomically reserves `key`; stores without an atomic primitive fall back to a racy read.
-    fn claim<'a>(&'a self, key: &'a str, ttl: Duration) -> BoxFuture<'a, Result<Claim>> {
-        let _ = ttl;
-        Box::pin(async move {
-            Ok(match self.get(key).await? {
-                Some(existing) => Claim::Lost {
-                    existing: Some(existing),
-                },
-                None => Claim::Acquired,
-            })
-        })
-    }
+    ) -> BoxFuture<'a, Result<bool>>;
 
     /// Polls for a finished result until `timeout` elapses.
     fn await_result<'a>(
@@ -202,10 +199,8 @@ pub trait IdempotencyStore: Send + Sync + 'static {
         })
     }
 
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<()>> {
-        let _ = key;
-        Box::pin(async { Ok(()) })
-    }
+    /// Remove a live reservation only if its owner matches.
+    fn delete<'a>(&'a self, key: &'a str, owner: uuid::Uuid) -> BoxFuture<'a, Result<bool>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,7 +216,7 @@ enum Settled {
     Released,
 }
 
-type Lease = watch::Sender<Option<Settled>>;
+type Lease = (uuid::Uuid, watch::Sender<Option<Settled>>);
 
 /// L1 cache + in-process single-flight + optional distributed claim.
 pub struct TwoTierIdempotency {
@@ -281,18 +276,18 @@ impl TwoTierIdempotency {
         }
     }
 
-    fn try_lead(&self, key: &str) -> Option<watch::Receiver<Option<Settled>>> {
+    fn try_lead(&self, key: &str, owner: uuid::Uuid) -> Option<watch::Receiver<Option<Settled>>> {
         let mut leases = self.leases.lock().unwrap();
-        if let Some(lease) = leases.get(key) {
+        if let Some((_, lease)) = leases.get(key) {
             return Some(lease.subscribe());
         }
         let (tx, _rx) = watch::channel(None);
-        leases.insert(key.to_owned(), tx);
+        leases.insert(key.to_owned(), (owner, tx));
         None
     }
 
     fn settle_lease(&self, key: &str, outcome: Settled) {
-        if let Some(lease) = self.leases.lock().unwrap().remove(key) {
+        if let Some((_, lease)) = self.leases.lock().unwrap().remove(key) {
             lease.send_replace(Some(outcome));
         }
     }
@@ -305,8 +300,9 @@ impl TwoTierIdempotency {
         if let Some(entry) = self.l1_get(key) {
             return Ok(settle(entry, fingerprint));
         }
+        let owner = uuid::Uuid::now_v7();
         loop {
-            let Some(mut rx) = self.try_lead(key) else {
+            let Some(mut rx) = self.try_lead(key, owner) else {
                 break;
             };
             let outcome = loop {
@@ -326,7 +322,7 @@ impl TwoTierIdempotency {
 
         if let Some(store) = &self.distributed {
             let claimed = async {
-                match store.claim(key, self.ttl).await? {
+                match store.claim(key, owner, self.ttl).await? {
                     Claim::Acquired => Ok(None),
                     Claim::Lost {
                         existing: Some(existing),
@@ -361,29 +357,44 @@ impl TwoTierIdempotency {
         if key.is_empty() {
             return;
         }
-        self.l1_set(key, &entry);
-        self.settle_lease(key, Settled::Done(entry.clone()));
-        if let Some(store) = &self.distributed
-            && let Err(err) = store.set(key, entry, self.ttl).await
-        {
-            tracing::warn!(
-                event = "idem.commit.write.failed",
-                error = %err,
-                "distributed idempotency write failed; result kept in L1 only"
-            );
+        let Some(owner) = self.owner(key) else {
+            return;
+        };
+        if let Some(store) = &self.distributed {
+            match store.set(key, owner, entry.clone(), self.ttl).await {
+                Ok(true) => {}
+                outcome => {
+                    tracing::warn!(event = "idem.commit.write.failed", ?outcome);
+                    self.settle_lease(key, Settled::Released);
+                    return;
+                }
+            }
         }
+        self.l1_set(key, &entry);
+        self.settle_lease(key, Settled::Done(entry));
+    }
+
+    fn owner(&self, key: &str) -> Option<uuid::Uuid> {
+        self.leases
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|(owner, _)| *owner)
     }
 
     pub async fn release(&self, key: &str) {
         if key.is_empty() {
             return;
         }
-        self.settle_lease(key, Settled::Released);
+        let Some(owner) = self.owner(key) else {
+            return;
+        };
         if let Some(store) = &self.distributed
-            && let Err(err) = store.delete(key).await
+            && let Err(err) = store.delete(key, owner).await
         {
             tracing::debug!(event = "idem.release.failed", error = %err);
         }
+        self.settle_lease(key, Settled::Released);
     }
 }
 
@@ -409,14 +420,24 @@ mod tests {
         fn set<'a>(
             &'a self,
             _key: &'a str,
+            _owner: uuid::Uuid,
             _entry: IdempotencyEntry,
             _ttl: Duration,
-        ) -> BoxFuture<'a, Result<()>> {
+        ) -> BoxFuture<'a, Result<bool>> {
             Box::pin(async { panic!("a losing claimant must never commit") })
         }
 
-        fn claim<'a>(&'a self, _key: &'a str, _ttl: Duration) -> BoxFuture<'a, Result<Claim>> {
+        fn claim<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: uuid::Uuid,
+            _ttl: Duration,
+        ) -> BoxFuture<'a, Result<Claim>> {
             Box::pin(async { Ok(Claim::Lost { existing: None }) })
+        }
+
+        fn delete<'a>(&'a self, _key: &'a str, _owner: uuid::Uuid) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { panic!("a losing claimant must never delete") })
         }
 
         fn await_result<'a>(

@@ -8,6 +8,10 @@ pub fn request_subject(service: &str) -> String {
     format!("{service}{EVENTS_SUFFIX}")
 }
 
+pub fn scatter_subject(request_subject: &str) -> String {
+    format!("{request_subject}.scatter")
+}
+
 /// Method-scoped subject under `prefix`. In subscribe mode NATS wildcards pass through.
 pub fn method_subject(prefix: &str, method: &str, subscribe: bool) -> String {
     if method.is_empty() {

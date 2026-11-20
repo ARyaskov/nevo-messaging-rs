@@ -41,3 +41,13 @@ drains `Router::inflight()` before closing the connection.
 
 `Router::handle` is fully transport-agnostic; it sniffs the codec, decompresses,
 runs the pipeline and returns an encoded, optionally compressed response.
+
+
+### NATS replica routing
+
+Ordinary RPC and emits use `<service>-events`. All replicas join the queue
+group named after that subject by default. Set the same group on Rust and
+TypeScript replicas if overriding it. Scatter/gather uses the separate
+`<service>-events.scatter` subject with a plain subscription per replica.
+For an older router, use `RequestManyOptions::new().legacy_subject(true)`.
+Upgrade every replica before relying on single-replica delivery.

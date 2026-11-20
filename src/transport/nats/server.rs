@@ -8,7 +8,7 @@ use futures::StreamExt;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 
-use super::{Nats, NatsConfig, from_message, to_header_map};
+use super::{Nats, NatsConfig, from_message, subject::scatter_subject, to_header_map};
 use crate::error::Result;
 use crate::server::Router;
 
@@ -16,8 +16,7 @@ use crate::server::Router;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ServeConfig {
-    /// Load-balance requests across instances; `None` delivers every message to every instance,
-    /// which is what the TypeScript router does.
+    /// Queue group for ordinary requests. Defaults to the request subject.
     pub queue_group: Option<String>,
     pub concurrency: usize,
     pub drain_timeout: Duration,
@@ -141,33 +140,43 @@ impl NatsServer {
         let (stop, _) = watch::channel(false);
         let retained = Arc::new(AtomicUsize::new(0));
         let routers: Vec<Arc<Router>> = routers.into_iter().map(Arc::new).collect();
-        let mut pumps = Vec::with_capacity(routers.len());
+        let mut pumps = Vec::with_capacity(routers.len() * 2);
         for router in &routers {
             let subject = router.request_topic().to_owned();
-            let subscriber = match &config.queue_group {
-                Some(group) => {
-                    nats.client()
-                        .queue_subscribe(subject.clone(), group.clone())
-                        .await
-                }
-                None => nats.client().subscribe(subject.clone()).await,
-            }
-            .map_err(super::subscribe_error)?;
+            let queue = config
+                .queue_group
+                .clone()
+                .unwrap_or_else(|| subject.clone());
+            let scatter = scatter_subject(&subject);
+            let requests = nats
+                .client()
+                .queue_subscribe(subject.clone(), queue.clone())
+                .await
+                .map_err(super::subscribe_error)?;
+            let scatter_requests = nats
+                .client()
+                .subscribe(scatter.clone())
+                .await
+                .map_err(super::subscribe_error)?;
             tracing::info!(
                 event = "nats.router.listening",
                 service = router.service_name(),
                 subject = %subject,
-                queue_group = config.queue_group.as_deref().unwrap_or(""),
+                scatter = %scatter,
+                queue_group = %queue,
             );
-            pumps.push(tokio::spawn(pump(
-                nats.client().clone(),
-                Arc::clone(router),
-                subscriber,
-                stop.subscribe(),
-                config.concurrency,
-                config.drain_timeout,
-                Arc::clone(&retained),
-            )));
+            let semaphore = Arc::new(Semaphore::new(config.concurrency));
+            for subscriber in [requests, scatter_requests] {
+                pumps.push(tokio::spawn(pump(
+                    nats.client().clone(),
+                    Arc::clone(router),
+                    subscriber,
+                    stop.subscribe(),
+                    Arc::clone(&semaphore),
+                    config.drain_timeout,
+                    Arc::clone(&retained),
+                )));
+            }
         }
         Ok(Self {
             nats,
@@ -235,11 +244,10 @@ async fn pump(
     router: Arc<Router>,
     mut subscriber: async_nats::Subscriber,
     mut stop: watch::Receiver<bool>,
-    concurrency: usize,
+    semaphore: Arc<Semaphore>,
     drain_timeout: Duration,
     retained: Arc<AtomicUsize>,
 ) {
-    let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut accepted = tokio::task::JoinSet::new();
     loop {
         let message = tokio::select! {

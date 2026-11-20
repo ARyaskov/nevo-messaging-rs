@@ -187,6 +187,7 @@ impl NatsClientBuilder {
 pub struct RequestManyOptions {
     pub max_messages: usize,
     pub max_wait: Option<Duration>,
+    pub legacy_subject: bool,
     pub call: CallOptions,
 }
 
@@ -195,6 +196,7 @@ impl Default for RequestManyOptions {
         Self {
             max_messages: 10,
             max_wait: None,
+            legacy_subject: false,
             call: CallOptions::default(),
         }
     }
@@ -212,6 +214,12 @@ impl RequestManyOptions {
 
     pub fn max_wait(mut self, wait: Duration) -> Self {
         self.max_wait = Some(wait);
+        self
+    }
+
+    /// Use the original request subject for a pre-split router.
+    pub fn legacy_subject(mut self, enabled: bool) -> Self {
+        self.legacy_subject = enabled;
         self
     }
 
@@ -349,7 +357,10 @@ impl Client<Nats> {
             .await
             .map_err(super::subscribe_error)?;
         let outbound = encoded.outbound();
-        let subject = subject::request_subject(&service);
+        let mut subject = subject::request_subject(&service);
+        if !opts.legacy_subject {
+            subject = super::subject::scatter_subject(&subject);
+        }
         match to_header_map(&outbound.headers) {
             Some(headers) => {
                 nats.publish_with_reply_and_headers(subject, inbox, headers, outbound.payload)

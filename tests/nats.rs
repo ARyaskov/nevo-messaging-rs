@@ -322,10 +322,12 @@ async fn emit_reaches_the_router_without_a_reply() {
 async fn request_many_and_queue_groups() {
     let url = require_nats!();
     let service = unique("user");
-    let a = NatsServer::bind(user_router(&service, Arc::default()), [url.as_str()])
+    let hits_a = Arc::new(AtomicU32::new(0));
+    let hits_b = Arc::new(AtomicU32::new(0));
+    let a = NatsServer::bind(user_router(&service, hits_a.clone()), [url.as_str()])
         .await
         .unwrap();
-    let b = NatsServer::bind(user_router(&service, Arc::default()), [url.as_str()])
+    let b = NatsServer::bind(user_router(&service, hits_b.clone()), [url.as_str()])
         .await
         .unwrap();
     let c = client(&url, "frontend").await;
@@ -342,6 +344,33 @@ async fn request_many_and_queue_groups() {
         .await
         .unwrap();
     assert_eq!(replies.len(), 2);
+    let _: User = c
+        .query(
+            &service,
+            "user.getById",
+            &GetById {
+                id: BigInt::from(1u8),
+            },
+        )
+        .await
+        .unwrap();
+    // A second scatter round trips to both replicas, so both have had a chance
+    // to receive the earlier ordinary request.
+    let _: Vec<Value> = c
+        .request_many(
+            &service,
+            "user.echo",
+            &json!({}),
+            RequestManyOptions::new()
+                .max_messages(2)
+                .max_wait(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst),
+        1
+    );
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 

@@ -10,7 +10,7 @@ use futures::future::BoxFuture;
 use tokio::sync::watch;
 
 use crate::codec::Codec;
-use crate::error::Result;
+use crate::error::{Error, ErrorCode, Result};
 use crate::lru::TtlLru;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,7 +332,11 @@ impl TwoTierIdempotency {
                         existing: Some(existing),
                     } => Ok(Some(existing)),
                     Claim::Lost { existing: None } => {
-                        store.await_result(key, self.await_timeout).await
+                        let entry = store.await_result(key, self.await_timeout).await?;
+                        entry.map(Some).ok_or_else(|| {
+                            Error::new(ErrorCode::Timeout, "Idempotency owner is still pending")
+                                .with_retryable(true)
+                        })
                     }
                 }
             }
@@ -392,6 +396,45 @@ mod tests {
             codec: Codec::Json,
             payload: Bytes::from(tag.to_owned()),
             fingerprint: Some("fp".into()),
+        }
+    }
+
+    struct PendingStore;
+
+    impl IdempotencyStore for PendingStore {
+        fn get<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<Option<IdempotencyEntry>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn set<'a>(
+            &'a self,
+            _key: &'a str,
+            _entry: IdempotencyEntry,
+            _ttl: Duration,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { panic!("a losing claimant must never commit") })
+        }
+
+        fn claim<'a>(&'a self, _key: &'a str, _ttl: Duration) -> BoxFuture<'a, Result<Claim>> {
+            Box::pin(async { Ok(Claim::Lost { existing: None }) })
+        }
+
+        fn await_result<'a>(
+            &'a self,
+            _key: &'a str,
+            _timeout: Duration,
+        ) -> BoxFuture<'a, Result<Option<IdempotencyEntry>>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_distributed_owner_never_grants_execution() {
+        let idem =
+            TwoTierIdempotency::new(&IdempotencyConfig::default(), Some(Arc::new(PendingStore)));
+        for _ in 0..2 {
+            let error = idem.begin("pending", None).await.unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Timeout);
         }
     }
 

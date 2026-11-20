@@ -457,9 +457,13 @@ impl Router {
         Ok((codec, raw, head))
     }
 
-    fn finish(&self, _codec: Codec, bytes: Bytes) -> Outbound {
+    fn finish(&self, codec: Codec, bytes: Bytes) -> Outbound {
+        // A cached reply can use the codec of the first successful call.
+        let content_type = Codec::detect(&bytes).unwrap_or(codec).content_type();
         match compress(bytes, &self.compression) {
-            Ok((payload, encoding)) => Outbound::new(payload).encoded(encoding),
+            Ok((payload, encoding)) => Outbound::new(payload)
+                .encoded(encoding)
+                .header("content-type", content_type),
             Err(err) => {
                 tracing::error!(event = "dispatch.compress_failed", error = %err);
                 Outbound::new(Bytes::new())

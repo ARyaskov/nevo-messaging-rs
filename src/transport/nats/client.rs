@@ -263,48 +263,51 @@ impl<R: DeserializeOwned> Stream for QueryStream<R> {
         if this.done {
             return Poll::Ready(None);
         }
-        loop {
-            match Pin::new(&mut this.subscriber).poll_next(cx) {
-                Poll::Ready(Some(message)) => {
-                    this.idle
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + this.timeout);
-                    let inbound = from_message(message);
-                    let Ok((codec, raw)) = this.unpacker.unpack(&inbound) else {
-                        continue;
-                    };
-                    let Ok(head) = codec.decode::<RequestHead>(&raw) else {
-                        continue;
-                    };
-                    let ended =
-                        head.meta.as_ref().and_then(|m| m.header(HEADER_STREAM_END)) == Some("1");
-                    if ended {
-                        this.done = true;
-                        return Poll::Ready(None);
+        match Pin::new(&mut this.subscriber).poll_next(cx) {
+            Poll::Ready(Some(message)) => {
+                this.idle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.timeout);
+                let chunk = (|| {
+                    if message.status == Some(async_nats::StatusCode::NO_RESPONDERS) {
+                        return Err(Error::from_code(ErrorCode::ServiceUnavailable));
                     }
-                    match Core::unwrap_response::<R>(codec, &raw, &this.service) {
-                        Ok(chunk) => {
-                            this.count += 1;
-                            return Poll::Ready(Some(Ok(chunk)));
-                        }
-                        Err(_) => continue,
+                    let (codec, raw) = this.unpacker.unpack(&from_message(message))?;
+                    let head: RequestHead = codec.decode(&raw)?;
+                    if head.meta.as_ref().and_then(|m| m.header(HEADER_STREAM_END)) == Some("1") {
+                        return Ok(None);
+                    }
+                    Core::unwrap_response::<R>(codec, &raw, &this.service).map(Some)
+                })();
+                match chunk {
+                    Ok(Some(value)) => {
+                        this.count += 1;
+                        Poll::Ready(Some(Ok(value)))
+                    }
+                    Ok(None) => {
+                        this.done = true;
+                        Poll::Ready(None)
+                    }
+                    Err(error) => {
+                        this.done = true;
+                        Poll::Ready(Some(Err(error)))
                     }
                 }
-                Poll::Ready(None) => {
+            }
+            Poll::Ready(None) => {
+                this.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                if this.idle.as_mut().poll(cx).is_ready() {
                     this.done = true;
-                    return Poll::Ready(None);
+                    return Poll::Ready(Some(Err(Error::timeout(
+                        &this.service,
+                        &this.method,
+                        this.timeout,
+                    ))));
                 }
-                Poll::Pending => {
-                    if this.idle.as_mut().poll(cx).is_ready() {
-                        this.done = true;
-                        return Poll::Ready(Some(Err(Error::timeout(
-                            &this.service,
-                            &this.method,
-                            this.timeout,
-                        ))));
-                    }
-                    return Poll::Pending;
-                }
+                Poll::Pending
             }
         }
     }

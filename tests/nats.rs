@@ -384,6 +384,35 @@ async fn request_many_and_queue_groups() {
 }
 
 #[tokio::test]
+async fn query_stream_surfaces_a_remote_error() {
+    let url = require_nats!();
+    let service = unique("stream");
+    let router = Router::new(&service).route("reject", |_ctx: Context, _p: Value| async {
+        Err::<Value, _>(Error::bad_request("invalid chunk"))
+    });
+    let server = NatsServer::bind(router, [url.as_str()]).await.unwrap();
+    server.nats().client().flush().await.unwrap();
+    let c = client(&url, "frontend").await;
+    let mut stream = c
+        .query_stream::<_, Value>(
+            &service,
+            "reject",
+            &json!({}),
+            CallOptions::new().timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    let err = stream.next().await.unwrap().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::BadRequest);
+    assert_eq!(
+        nevo_messaging::transport::nats::QueryStream::count(&stream),
+        0
+    );
+    assert!(stream.next().await.is_none());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn compression_is_negotiated_per_direction() {
     let url = require_nats!();
     let service = unique("user");

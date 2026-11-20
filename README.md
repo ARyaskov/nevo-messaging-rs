@@ -34,7 +34,7 @@ touching them.
 
 ```toml
 [dependencies]
-nevo-messaging = "0.1"
+nevo-messaging = "0.2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```

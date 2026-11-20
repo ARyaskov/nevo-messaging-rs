@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: "23 4 * * 1"
   workflow_dispatch:
+    inputs:
+      typescript_ref:
+        description: TypeScript branch, tag, or revision for the source interop job
+        default: main
+        type: string
 
 permissions:
   contents: read
@@ -72,14 +77,62 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      # Lockfile-exact install without lifecycle scripts.
-      - name: Install the TypeScript peer
+      - name: Install the published TypeScript peer
         run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: tests/interop
       - run: cargo test --locked --all-features
         env:
           NEVO_TEST_NATS_URL: nats://127.0.0.1:4222
       - run: cargo test --locked --no-default-features --lib
+
+  current-typescript-interop:
+    name: Current TypeScript interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ARyaskov/nevo-messaging
+          ref: ${{ inputs.typescript_ref || 'main' }}
+          path: ts-peer
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: ts-peer/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Build and pack the checked-out TypeScript peer
+        working-directory: ts-peer
+        run: |
+          git rev-parse HEAD
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm run build
+          pnpm pack --pack-destination ../tests/interop
+      - name: Install the packed peer
+        working-directory: tests/interop
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm install --no-save --package-lock=false --ignore-scripts --no-audit --no-fund ./riaskov-nevo-messaging-*.tgz
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2 -js -m 8222
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:8222/healthz?js-enabled-only=true" && exit 0
+            sleep 1
+          done
+          docker logs nats
+          exit 1
+      - run: cargo test --locked --all-features --test interop
+        env:
+          NEVO_INTEROP_CURRENT_TS: "1"
+          NEVO_TEST_NATS_URL: nats://127.0.0.1:4222
 
   secret-scan:
     name: Secret scan (gitleaks)

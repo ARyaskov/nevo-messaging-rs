@@ -12,6 +12,8 @@ const { headers: createHeaders } = require("@nats-io/nats-core")
 const servers = (process.env.NEVO_TEST_NATS_URL || "nats://127.0.0.1:4222").split(",")
 const rustService = process.env.NEVO_INTEROP_RUST_SERVICE || "rs-user"
 const tsService = process.env.NEVO_INTEROP_TS_SERVICE || "ts-user"
+const currentTs = process.env.NEVO_INTEROP_CURRENT_TS === "1"
+const splitSubjects = currentTs && typeof nevo.NATS_SCATTER_SUFFIX === "string"
 
 function emit(obj) {
   const line = JSON.stringify(obj, (_k, v) => (typeof v === "bigint" ? `${v}n` : v))
@@ -64,6 +66,18 @@ nevo.addSignalMetadata(UserController, "user.large", "large", (d) => [d])
 
 async function serveTypescriptRouter(nc) {
   const options = { serviceName: tsService, tracing: { enabled: false }, devtools: false }
+  if (currentTs) {
+    nevo.NatsSignalRouter(UserService, {
+      ...options,
+      compression: { enabled: true, algorithm: "gzip", threshold: 512 }
+    })(UserController)
+    nevo.bindSignalRouterForTesting(UserController, options)
+    const controller = new UserController()
+    controller.__nevoNatsUniversalClient = { ensureConnection: async () => nc }
+    await controller.onModuleInit()
+    await nc.flush()
+    return { unsubscribe: () => controller.onModuleDestroy() }
+  }
   const decorate = nevo.createSignalRouterDecorator(
     UserService,
     options,
@@ -157,7 +171,7 @@ async function main() {
   })
   const jsonClient = await nevo.NevoNatsClient.create([rustService], {
     servers,
-    serviceName: "ts-json",
+    serviceName: "ts-caller",
     codec: new nevo.JsonCodec(),
     retry: { enabled: false }
   })
@@ -168,11 +182,22 @@ async function main() {
   const broadcastSub = await client.subscribe("__broadcast", "system.status", {}, async (data) => {
     emit({ kind: "broadcast", data })
   })
-  emit({ kind: "ready" })
+  emit({ kind: "ready", splitSubjects })
 
   await callRust(client)
   const fromJson = await jsonClient.query(rustService, "user.getById", { id: 7n })
   emit({ kind: "json-query", id: fromJson.id, idType: typeof fromJson.id })
+  if (splitSubjects) {
+    const echoed = await jsonClient.query(
+      rustService,
+      "user.echo",
+      { s: "@@nevo:bigint:5", plain: "x", n: 2n },
+      { tenantId: "t1", idempotencyKey: "k-1", headers: { "x-h": "retry" } }
+    )
+    emit({ kind: "cross-codec-hit", header: echoed.header })
+    const answers = await client.requestMany(rustService, "user.echo", {}, { maxMessages: 1 })
+    emit({ kind: "scatter", count: answers.length })
+  }
   emit({ kind: "done" })
 
   await new Promise((resolve) => {
@@ -182,7 +207,7 @@ async function main() {
   })
   await subscription.unsubscribe()
   await broadcastSub.unsubscribe()
-  routerSub.unsubscribe()
+  await routerSub.unsubscribe()
   await client.close(1000)
   await jsonClient.close(1000)
   await nc.drain()

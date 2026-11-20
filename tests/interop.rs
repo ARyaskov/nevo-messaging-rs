@@ -26,11 +26,8 @@ fn interop_dir() -> PathBuf {
         .join("interop")
 }
 
-// Scope note: this harness drives the PUBLISHED npm package
-// `@riaskov/nevo-messaging` 2.6.1 (pinned in tests/interop/package.json),
-// not the current TypeScript tree. A pass here is a legacy wire-compatibility
-// gate against 2.6.1 only and must NOT be cited as verifying the current TS
-// sources paired with this Rust revision.
+// The package lock pins the published peer. The checkout job installs a
+// tarball from the checked-out TypeScript tree into the same fixture instead.
 fn prerequisites() -> Option<String> {
     let url = std::env::var("NEVO_TEST_NATS_URL")
         .ok()
@@ -216,7 +213,14 @@ async fn typescript_and_rust_peers_interoperate() {
         .unwrap();
 
     let mut peer = Peer::spawn(&url, &rust_service, &ts_service).await;
-    peer.expect("ready").await;
+    let ready = peer.expect("ready").await;
+    let split_subjects = ready["splitSubjects"] == true;
+    if std::env::var("NEVO_INTEROP_EXPECT_SPLIT").as_deref() == Ok("1") {
+        assert!(
+            split_subjects,
+            "the TypeScript package with split subjects was not loaded"
+        );
+    }
 
     let query = peer.expect("query").await;
     assert_eq!(query["id"], "9007199254740993n");
@@ -266,6 +270,20 @@ async fn typescript_and_rust_peers_interoperate() {
     let json_query = peer.expect("json-query").await;
     assert_eq!(json_query["id"], "7n");
     assert_eq!(json_query["idType"], "bigint");
+    if split_subjects {
+        assert_eq!(peer.expect("cross-codec-hit").await["header"], "v");
+        assert_eq!(peer.expect("scatter").await["count"], 1);
+        let replies: Vec<Value> = client
+            .request_many(
+                &ts_service,
+                "user.echo",
+                &json!({"scatter": true}),
+                nevo_messaging::transport::nats::RequestManyOptions::new().max_messages(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec![json!({"scatter": true})]);
+    }
     peer.expect("done").await;
 
     let published = tokio::time::timeout(Duration::from_secs(5), placed.next())

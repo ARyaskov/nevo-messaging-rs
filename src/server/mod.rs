@@ -641,7 +641,7 @@ impl Router {
             (Some(_), Some(_)) => fingerprint::of_params(codec, &raw),
             _ => None,
         };
-        let mut claimed = false;
+        let mut lease = None;
         if let Some(key) = &idem_key {
             match self.idempotency.begin(key, fingerprint.as_deref()).await {
                 Ok(Begin::Hit(entry)) => {
@@ -656,7 +656,7 @@ impl Router {
                         ),
                     ));
                 }
-                Ok(Begin::Execute) => claimed = true,
+                Ok(Begin::Execute(claimed)) => lease = claimed,
                 Err(err) => return fail(&err),
             }
         }
@@ -677,8 +677,8 @@ impl Router {
         let route = match self.resolve_route(&parsed) {
             Ok(route) => route,
             Err(err) => {
-                if claimed && let Some(key) = &idem_key {
-                    self.idempotency.release(key).await;
+                if let Some(lease) = lease {
+                    lease.release().await;
                 }
                 return fail(&err);
             }
@@ -686,8 +686,8 @@ impl Router {
 
         for interceptor in &self.interceptors {
             if let Err(err) = interceptor.before(&ctx).await {
-                if claimed && let Some(key) = &idem_key {
-                    self.idempotency.release(key).await;
+                if let Some(lease) = lease {
+                    lease.release().await;
                 }
                 return fail(&err);
             }
@@ -714,24 +714,21 @@ impl Router {
 
         match outcome {
             Ok(bytes) => {
-                if claimed && let Some(key) = &idem_key {
-                    self.idempotency
-                        .commit(
-                            key,
-                            IdempotencyEntry {
-                                codec,
-                                payload: bytes.clone(),
-                                fingerprint,
-                            },
-                        )
+                if let Some(lease) = lease {
+                    lease
+                        .commit(IdempotencyEntry {
+                            codec,
+                            payload: bytes.clone(),
+                            fingerprint,
+                        })
                         .await;
                 }
                 self.record_outcome(Some(&method), None, started);
                 bytes
             }
             Err(err) => {
-                if claimed && let Some(key) = &idem_key {
-                    self.idempotency.release(key).await;
+                if let Some(lease) = lease {
+                    lease.release().await;
                 }
                 if err.code() != ErrorCode::RateLimited {
                     tracing::error!(

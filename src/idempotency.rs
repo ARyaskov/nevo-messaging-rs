@@ -203,11 +203,11 @@ pub trait IdempotencyStore: Send + Sync + 'static {
     fn delete<'a>(&'a self, key: &'a str, owner: uuid::Uuid) -> BoxFuture<'a, Result<bool>>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Begin {
+#[derive(Debug)]
+pub enum Begin<'a> {
     Hit(IdempotencyEntry),
     Conflict,
-    Execute,
+    Execute(Option<ExecutionLease<'a>>),
 }
 
 #[derive(Debug, Clone)]
@@ -241,7 +241,7 @@ fn conflicts(stored: Option<&str>, incoming: Option<&str>) -> bool {
     matches!((stored, incoming), (Some(a), Some(b)) if a != b)
 }
 
-fn settle(entry: IdempotencyEntry, fingerprint: Option<&str>) -> Begin {
+fn settle(entry: IdempotencyEntry, fingerprint: Option<&str>) -> Begin<'static> {
     if conflicts(entry.fingerprint.as_deref(), fingerprint) {
         Begin::Conflict
     } else {
@@ -286,16 +286,19 @@ impl TwoTierIdempotency {
         None
     }
 
-    fn settle_lease(&self, key: &str, outcome: Settled) {
-        if let Some((_, lease)) = self.leases.lock().unwrap().remove(key) {
-            lease.send_replace(Some(outcome));
+    fn settle_lease(&self, key: &str, owner: uuid::Uuid, outcome: Settled) {
+        let mut leases = self.leases.lock().unwrap();
+        if let std::collections::hash_map::Entry::Occupied(slot) = leases.entry(key.to_owned())
+            && slot.get().0 == owner
+        {
+            slot.remove().1.send_replace(Some(outcome));
         }
     }
 
-    /// On `Execute` the caller must later [`commit`](Self::commit) or [`release`](Self::release).
-    pub async fn begin(&self, key: &str, fingerprint: Option<&str>) -> Result<Begin> {
+    /// Reserve execution. Dropping the returned lease wakes local waiters.
+    pub async fn begin<'a>(&'a self, key: &'a str, fingerprint: Option<&str>) -> Result<Begin<'a>> {
         if key.is_empty() || !self.is_enabled() {
-            return Ok(Begin::Execute);
+            return Ok(Begin::Execute(None));
         }
         if let Some(entry) = self.l1_get(key) {
             return Ok(settle(entry, fingerprint));
@@ -320,6 +323,16 @@ impl TwoTierIdempotency {
             }
         }
 
+        let lease = ExecutionLease {
+            runtime: self,
+            key,
+            owner,
+            settled: false,
+        };
+        if let Some(entry) = self.l1_get(key) {
+            lease.settle(Settled::Done(entry.clone()));
+            return Ok(settle(entry, fingerprint));
+        }
         if let Some(store) = &self.distributed {
             let claimed = async {
                 match store.claim(key, owner, self.ttl).await? {
@@ -340,61 +353,66 @@ impl TwoTierIdempotency {
             match claimed {
                 Ok(Some(existing)) => {
                     self.l1_set(key, &existing);
-                    self.settle_lease(key, Settled::Done(existing.clone()));
+                    lease.settle(Settled::Done(existing.clone()));
                     return Ok(settle(existing, fingerprint));
                 }
                 Ok(None) => {}
-                Err(err) => {
-                    self.settle_lease(key, Settled::Released);
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             }
         }
-        Ok(Begin::Execute)
+        Ok(Begin::Execute(Some(lease)))
+    }
+}
+
+/// Ownership of an in-flight operation. The distributed claim expires if an
+/// aborted task cannot release it through the asynchronous store API.
+#[derive(Debug)]
+pub struct ExecutionLease<'a> {
+    runtime: &'a TwoTierIdempotency,
+    key: &'a str,
+    owner: uuid::Uuid,
+    settled: bool,
+}
+
+impl ExecutionLease<'_> {
+    fn settle(mut self, result: Settled) {
+        self.runtime.settle_lease(self.key, self.owner, result);
+        self.settled = true;
     }
 
-    pub async fn commit(&self, key: &str, entry: IdempotencyEntry) {
-        if key.is_empty() {
-            return;
-        }
-        let Some(owner) = self.owner(key) else {
-            return;
-        };
-        if let Some(store) = &self.distributed {
-            match store.set(key, owner, entry.clone(), self.ttl).await {
+    pub async fn commit(self, entry: IdempotencyEntry) {
+        if let Some(store) = &self.runtime.distributed {
+            match store
+                .set(self.key, self.owner, entry.clone(), self.runtime.ttl)
+                .await
+            {
                 Ok(true) => {}
                 outcome => {
                     tracing::warn!(event = "idem.commit.write.failed", ?outcome);
-                    self.settle_lease(key, Settled::Released);
                     return;
                 }
             }
         }
-        self.l1_set(key, &entry);
-        self.settle_lease(key, Settled::Done(entry));
+        self.runtime.l1_set(self.key, &entry);
+        self.settle(Settled::Done(entry));
     }
 
-    fn owner(&self, key: &str) -> Option<uuid::Uuid> {
-        self.leases
-            .lock()
-            .unwrap()
-            .get(key)
-            .map(|(owner, _)| *owner)
-    }
-
-    pub async fn release(&self, key: &str) {
-        if key.is_empty() {
-            return;
-        }
-        let Some(owner) = self.owner(key) else {
-            return;
-        };
-        if let Some(store) = &self.distributed
-            && let Err(err) = store.delete(key, owner).await
+    pub async fn release(self) {
+        if let Some(store) = &self.runtime.distributed
+            && let Err(err) = store.delete(self.key, self.owner).await
         {
             tracing::debug!(event = "idem.release.failed", error = %err);
         }
-        self.settle_lease(key, Settled::Released);
+        self.settle(Settled::Released);
+    }
+}
+
+impl Drop for ExecutionLease<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.runtime
+                .settle_lease(self.key, self.owner, Settled::Released);
+        }
     }
 }
 
@@ -462,36 +480,38 @@ mod tests {
     #[tokio::test]
     async fn single_flight_collapses_concurrent_callers() {
         let idem = Arc::new(TwoTierIdempotency::new(&IdempotencyConfig::new(), None));
-        let leader = idem.begin("k", Some("fp")).await.unwrap();
-        assert_eq!(leader, Begin::Execute);
+        let Begin::Execute(Some(leader)) = idem.begin("k", Some("fp")).await.unwrap() else {
+            panic!("first call must own the key");
+        };
         let follower = {
             let idem = Arc::clone(&idem);
-            tokio::spawn(async move { idem.begin("k", Some("fp")).await.unwrap() })
+            tokio::spawn(async move {
+                assert!(
+                    matches!(idem.begin("k", Some("fp")).await.unwrap(), Begin::Hit(hit) if hit == entry("v1"))
+                );
+            })
         };
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        idem.commit("k", entry("v1")).await;
-        assert_eq!(follower.await.unwrap(), Begin::Hit(entry("v1")));
-        assert_eq!(
+        leader.commit(entry("v1")).await;
+        follower.await.unwrap();
+        assert!(matches!(
             idem.begin("k", Some("other")).await.unwrap(),
             Begin::Conflict
-        );
-        assert_eq!(
-            idem.begin("k", None).await.unwrap(),
-            Begin::Hit(entry("v1"))
-        );
+        ));
     }
 
     #[tokio::test]
-    async fn release_lets_a_follower_take_over() {
-        let idem = Arc::new(TwoTierIdempotency::new(&IdempotencyConfig::new(), None));
-        assert_eq!(idem.begin("k", None).await.unwrap(), Begin::Execute);
-        let follower = {
-            let idem = Arc::clone(&idem);
-            tokio::spawn(async move { idem.begin("k", None).await.unwrap() })
-        };
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        idem.release("k").await;
-        assert_eq!(follower.await.unwrap(), Begin::Execute);
+    async fn dropping_the_leader_wakes_a_waiting_follower() {
+        let idem = TwoTierIdempotency::new(&IdempotencyConfig::new(), None);
+        let leader = idem.begin("k", None).await.unwrap();
+        assert!(matches!(leader, Begin::Execute(Some(_))));
+        let mut follower = std::pin::pin!(idem.begin("k", None));
+        assert!(futures::poll!(follower.as_mut()).is_pending());
+        drop(leader);
+        let result = tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Begin::Execute(Some(_))));
     }
 
     #[test]

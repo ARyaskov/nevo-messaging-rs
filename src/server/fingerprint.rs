@@ -26,6 +26,8 @@ const TAG_MAP: u8 = 12;
 const TAG_MAP_END: u8 = 13;
 const TAG_VARIANT: u8 = 14;
 
+type DigestBytes = [u8; 32];
+
 struct HashVisitor;
 
 struct HashSeed;
@@ -33,31 +35,31 @@ struct HashSeed;
 impl<'de> DeserializeSeed<'de> for HashSeed {
     // Each seed hashes its subtree on its own hasher and returns the digest, so
     // map entries can be reordered canonically before their parent hashes them.
-    type Value = Vec<u8>;
+    type Value = DigestBytes;
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Vec<u8>, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<DigestBytes, D::Error> {
         deserializer.deserialize_any(HashVisitor)
     }
 }
 
-fn digest_of(update: impl FnOnce(&mut Sha256)) -> Vec<u8> {
+fn digest_of(update: impl FnOnce(&mut Sha256)) -> DigestBytes {
     let mut hasher = Sha256::new();
     update(&mut hasher);
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
 impl<'de> Visitor<'de> for HashVisitor {
-    type Value = Vec<u8>;
+    type Value = DigestBytes;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any value")
     }
 
-    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Vec<u8>, E> {
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<DigestBytes, E> {
         Ok(digest_of(|h| h.update([TAG_BOOL, u8::from(v)])))
     }
 
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Vec<u8>, E> {
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<DigestBytes, E> {
         if v >= 0 {
             return self.visit_u64(v as u64);
         }
@@ -67,14 +69,14 @@ impl<'de> Visitor<'de> for HashVisitor {
         }))
     }
 
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Vec<u8>, E> {
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<DigestBytes, E> {
         Ok(digest_of(|h| {
             h.update([TAG_UINT]);
             h.update(v.to_le_bytes());
         }))
     }
 
-    fn visit_i128<E: de::Error>(self, v: i128) -> Result<Vec<u8>, E> {
+    fn visit_i128<E: de::Error>(self, v: i128) -> Result<DigestBytes, E> {
         if let Ok(small) = i64::try_from(v) {
             return self.visit_i64(small);
         }
@@ -87,7 +89,7 @@ impl<'de> Visitor<'de> for HashVisitor {
         }))
     }
 
-    fn visit_u128<E: de::Error>(self, v: u128) -> Result<Vec<u8>, E> {
+    fn visit_u128<E: de::Error>(self, v: u128) -> Result<DigestBytes, E> {
         if let Ok(small) = u64::try_from(v) {
             return self.visit_u64(small);
         }
@@ -97,7 +99,7 @@ impl<'de> Visitor<'de> for HashVisitor {
         }))
     }
 
-    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Vec<u8>, E> {
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<DigestBytes, E> {
         if v.is_finite() && v.fract() == 0.0 && v.abs() < 9.007_199_254_740_992e15 {
             return self.visit_i64(v as i64);
         }
@@ -107,11 +109,11 @@ impl<'de> Visitor<'de> for HashVisitor {
         }))
     }
 
-    fn visit_f32<E: de::Error>(self, v: f32) -> Result<Vec<u8>, E> {
+    fn visit_f32<E: de::Error>(self, v: f32) -> Result<DigestBytes, E> {
         self.visit_f64(f64::from(v))
     }
 
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<DigestBytes, E> {
         Ok(digest_of(|h| {
             h.update([TAG_STR]);
             h.update((v.len() as u64).to_le_bytes());
@@ -119,7 +121,7 @@ impl<'de> Visitor<'de> for HashVisitor {
         }))
     }
 
-    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<DigestBytes, E> {
         Ok(digest_of(|h| {
             h.update([TAG_BYTES]);
             h.update((v.len() as u64).to_le_bytes());
@@ -127,41 +129,37 @@ impl<'de> Visitor<'de> for HashVisitor {
         }))
     }
 
-    fn visit_none<E: de::Error>(self) -> Result<Vec<u8>, E> {
+    fn visit_none<E: de::Error>(self) -> Result<DigestBytes, E> {
         Ok(digest_of(|h| h.update([TAG_NULL])))
     }
 
-    fn visit_unit<E: de::Error>(self) -> Result<Vec<u8>, E> {
+    fn visit_unit<E: de::Error>(self) -> Result<DigestBytes, E> {
         Ok(digest_of(|h| h.update([TAG_NULL])))
     }
 
-    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Vec<u8>, D::Error> {
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<DigestBytes, D::Error> {
         deserializer.deserialize_any(self)
     }
 
     fn visit_newtype_struct<D: Deserializer<'de>>(
         self,
         deserializer: D,
-    ) -> Result<Vec<u8>, D::Error> {
+    ) -> Result<DigestBytes, D::Error> {
         deserializer.deserialize_any(self)
     }
 
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
-        let mut items = Vec::new();
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<DigestBytes, A::Error> {
+        let mut digest = Sha256::new();
+        digest.update([TAG_SEQ]);
         while let Some(item) = seq.next_element_seed(HashSeed)? {
-            items.push(item);
+            digest.update(item);
         }
-        Ok(digest_of(|h| {
-            h.update([TAG_SEQ]);
-            for item in &items {
-                h.update(item);
-            }
-            h.update([TAG_SEQ_END]);
-        }))
+        digest.update([TAG_SEQ_END]);
+        Ok(digest.finalize().into())
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Vec<u8>, A::Error> {
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<DigestBytes, A::Error> {
+        let mut entries: Vec<(DigestBytes, DigestBytes)> = Vec::new();
         while let Some(key) = map.next_key_seed(HashSeed)? {
             let value = map.next_value_seed(HashSeed)?;
             entries.push((key, value));
@@ -179,13 +177,13 @@ impl<'de> Visitor<'de> for HashVisitor {
         }))
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Vec<u8>, A::Error> {
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<DigestBytes, A::Error> {
         let (variant, rest) = data.variant_seed(HashSeed)?;
         let value = rest.newtype_variant_seed(HashSeed)?;
         Ok(digest_of(|h| {
             h.update([TAG_VARIANT]);
-            h.update(&variant);
-            h.update(&value);
+            h.update(variant);
+            h.update(value);
         }))
     }
 }
@@ -234,6 +232,14 @@ mod tests {
     fn fp(codec: Codec, params: serde_json::Value) -> String {
         let raw = codec.encode(&Request::new("u", "m", params)).unwrap();
         of_params(codec, &raw).unwrap()
+    }
+
+    #[test]
+    fn array_fingerprint_preserves_the_wire_digest() {
+        assert_eq!(
+            fp(Codec::Json, json!([1, 2, 3])),
+            "31cb3c25439af9103ad65c4dd726a5a1"
+        );
     }
 
     #[test]

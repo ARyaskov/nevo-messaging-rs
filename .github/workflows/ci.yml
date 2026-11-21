@@ -10,8 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       typescript_ref:
-        description: TypeScript branch, tag, or revision for the source interop job
-        default: main
+        description: TypeScript branch, tag, or revision (uses the repository default if omitted)
         type: string
 
 permissions:
@@ -96,7 +95,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ARyaskov/nevo-messaging
-          ref: ${{ inputs.typescript_ref || 'main' }}
+          ref: ${{ inputs.typescript_ref }}
           path: ts-peer
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -132,6 +131,7 @@ jobs:
       - run: cargo test --locked --all-features --test interop
         env:
           NEVO_INTEROP_CURRENT_TS: "1"
+          NEVO_INTEROP_EXPECT_SPLIT: ${{ !inputs.typescript_ref && '1' || '0' }}
           NEVO_TEST_NATS_URL: nats://127.0.0.1:4222
 
   secret-scan:

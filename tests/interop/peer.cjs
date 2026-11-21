@@ -14,6 +14,7 @@ const rustService = process.env.NEVO_INTEROP_RUST_SERVICE || "rs-user"
 const tsService = process.env.NEVO_INTEROP_TS_SERVICE || "ts-user"
 const currentTs = process.env.NEVO_INTEROP_CURRENT_TS === "1"
 const splitSubjects = currentTs && typeof nevo.NATS_SCATTER_SUFFIX === "string"
+const bindRouter = nevo.bindNevoRouter ?? nevo.bindSignalRouterForTesting
 
 function emit(obj) {
   const line = JSON.stringify(obj, (_k, v) => (typeof v === "bigint" ? `${v}n` : v))
@@ -65,13 +66,16 @@ nevo.addSignalMetadata(UserController, "user.fail", "fail")
 nevo.addSignalMetadata(UserController, "user.large", "large", (d) => [d])
 
 async function serveTypescriptRouter(nc) {
+  if (typeof bindRouter !== "function") {
+    throw new Error("The selected TypeScript package cannot bind the router. Select a revision with the Nevo router runtime API.")
+  }
   const options = { serviceName: tsService, tracing: { enabled: false }, devtools: false }
   if (currentTs) {
     nevo.NatsSignalRouter(UserService, {
       ...options,
       compression: { enabled: true, algorithm: "gzip", threshold: 512 }
     })(UserController)
-    nevo.bindSignalRouterForTesting(UserController, options)
+    bindRouter(UserController, options)
     const controller = new UserController()
     controller.__nevoNatsUniversalClient = { ensureConnection: async () => nc }
     await controller.onModuleInit()
@@ -85,7 +89,7 @@ async function serveTypescriptRouter(nc) {
     () => {}
   )
   decorate(UserController)
-  nevo.bindSignalRouterForTesting(UserController, options)
+  bindRouter(UserController, options)
   const controller = new UserController()
   const codec = nevo.getDefaultCodec()
   const compression = nevo.resolveCompressionOptions({ enabled: true, algorithm: "gzip", threshold: 512 })

@@ -8,6 +8,11 @@ methods, error propagation, compression in both directions, `emit`, `publish`
 → `subscribe`, `broadcast`, `requestMany`, `nevo.contract`, bigint, `Date`,
 `undefined` and escaped strings.
 
+Rust `nevo-messaging` 0.3.1 targets TypeScript
+`@riaskov/nevo-messaging` 2.7.1. The source interop job installs a tarball
+built from the selected TypeScript revision. A separate test installs the
+published TypeScript 2.7.1 fixture pinned in `tests/interop/package-lock.json`.
+
 ## Mapping the TypeScript API
 
 | TypeScript | Rust |
@@ -45,12 +50,12 @@ methods, error propagation, compression in both directions, `emit`, `publish`
   key, so a tenant or version change is always a miss; its payload fingerprint
   hashes the raw wire params, so a typed `BigInt` and a string carrying the
   same `@@nevo:bigint:` literal never collide.
-- **Queue groups.** The TypeScript router subscribes without a queue group, so
-  every instance receives every request. `NatsServerBuilder::queue_group`
-  opts into load balancing; leave it unset for parity.
-- **Concurrency.** The TypeScript router processes messages one at a time;
-  this server dispatches concurrently, bounded by
-  `NatsServerBuilder::concurrency` (1024 by default).
+- **Queue groups.** Both routers load-balance ordinary requests using the
+  request subject as the default queue group. Use the same custom queue group
+  on all replicas if you override it. Scatter/gather uses a separate subject.
+- **Concurrency.** The TypeScript router defaults to one active handler per
+  subscription and accepts a `concurrency` option. The Rust server defaults
+  to 1024 active handlers per router, shared across its subscriptions.
 - **Bad envelopes.** An undecodable request is answered with `PARSE_ERROR`
   rather than left to time out.
 - **Params validation.** A `params` value that does not deserialise into the

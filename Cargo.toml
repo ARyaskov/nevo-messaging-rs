@@ -1,6 +1,6 @@
 [package]
 name = "nevo-messaging"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Microservices messaging framework wire-compatible with @riaskov/nevo-messaging: request/reply, events, pub/sub, broadcast over NATS with MessagePack/JSON, retry, circuit breaker, idempotency, ACL, discovery"

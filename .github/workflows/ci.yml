@@ -81,6 +81,8 @@ jobs:
         working-directory: tests/interop
       - run: cargo test --locked --all-features
         env:
+          NEVO_INTEROP_CURRENT_TS: "1"
+          NEVO_INTEROP_EXPECT_SPLIT: "1"
           NEVO_TEST_NATS_URL: nats://127.0.0.1:4222
       - run: cargo test --locked --no-default-features --lib
 
